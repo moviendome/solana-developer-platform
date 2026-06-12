@@ -18,6 +18,7 @@ import {
 } from "@/app/dashboard/payments/payments-workspace.data";
 import { Button } from "@/components/ui/button";
 import { CounterpartyPicker } from "./components/counterparty-picker";
+import { CounterpartyRecentTransfers } from "./components/counterparty-recent-transfers";
 import { OfframpStepContent } from "./components/offramp-step-content";
 import { OnchainReceiveStepContent } from "./components/onchain-receive-step-content";
 import { OnchainSendStepContent } from "./components/onchain-send-step-content";
@@ -132,14 +133,16 @@ function OfframpRail({
       counterpartyDialogOpen={false}
       setCounterpartyDialogOpen={() => {}}
       onCounterpartyCreated={() => {}}
-      footer={
-        wizard.currentStepId === "COMPLETE" && wizard.quote ? (
-          <PoweredByRampProvider provider={wizard.quote.provider} />
+      header={
+        wizard.fields.provider &&
+        (wizard.currentStepId === "REQUIREMENTS" || wizard.currentStepId === "COMPLETE") ? (
+          <PoweredByRampProvider provider={wizard.fields.provider} />
         ) : null
       }
+      secondaryLabel={wizard.onTransactionStage ? "Cancel" : undefined}
       footerActions={
         transferTerminal ? (
-          <Button asChild type="button" variant="secondary" className="h-14 rounded-full text-base">
+          <Button asChild type="button" variant="secondary" className="self-center rounded-full">
             <Link href={`/dashboard/payments/counterparty/${wizard.fields.counterpartyId}`}>
               Go to transaction
             </Link>
@@ -244,14 +247,16 @@ function OnrampRail({
       counterpartyDialogOpen={false}
       setCounterpartyDialogOpen={() => {}}
       onCounterpartyCreated={() => {}}
-      footer={
-        wizard.currentStepId === "PROVIDER" && wizard.quote ? (
-          <PoweredByRampProvider provider={wizard.quote.provider} />
+      header={
+        wizard.fields.provider &&
+        (wizard.currentStepId === "REQUIREMENTS" || wizard.currentStepId === "PROVIDER") ? (
+          <PoweredByRampProvider provider={wizard.fields.provider} />
         ) : null
       }
+      secondaryLabel={wizard.onTransactionStage ? "Cancel" : undefined}
       footerActions={
         transferTerminal ? (
-          <Button asChild type="button" variant="secondary" className="h-14 rounded-full text-base">
+          <Button asChild type="button" variant="secondary" className="self-center rounded-full">
             <Link href={`/dashboard/payments/counterparty/${wizard.fields.counterpartyId}`}>
               Go to transaction
             </Link>
@@ -392,13 +397,16 @@ export function PaymentsActionPage(props: PaymentsActionPageProps) {
       onCounterpartyCreated={handleCounterpartyCreated}
     >
       {phase === "counterparty" ? (
-        <CounterpartyPicker
-          mode={mode}
-          counterpartiesResult={liveCounterparties}
-          value={counterpartyId || null}
-          onChange={selectCounterparty}
-          onAddClick={() => setCounterpartyDialogOpen(true)}
-        />
+        <>
+          <CounterpartyPicker
+            mode={mode}
+            counterpartiesResult={liveCounterparties}
+            value={counterpartyId || null}
+            onChange={selectCounterparty}
+            onAddClick={() => setCounterpartyDialogOpen(true)}
+          />
+          {counterpartyId ? <CounterpartyRecentTransfers counterpartyId={counterpartyId} /> : null}
+        </>
       ) : (
         <PaymentMethodStep mode={mode} value={method} onChange={setMethod} />
       )}

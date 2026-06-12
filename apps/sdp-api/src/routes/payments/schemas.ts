@@ -393,7 +393,11 @@ export const listTransfersQuerySchema = z.object({
   walletAddress: z.string().optional(),
   token: z.string().optional(),
   direction: transferDirectionSchema.optional(),
-  status: transferStatusSchema.optional(),
+  status: z
+    .string()
+    .transform((value) => value.split(","))
+    .pipe(z.array(transferStatusSchema).min(1))
+    .optional(),
   category: z.enum(["wallet", "ramp"]).optional(),
   counterpartyId: z.string().min(1).optional(),
   provider: rampProviderSchema.optional(),
@@ -458,6 +462,7 @@ export const createOfframpQuoteSchema = z.object({
   fiatCurrency: rampFiatCurrencySchema.optional(),
   cryptoAmount: paymentAmountSchema,
   redirectUrl: z.string().url().optional(),
+  collectedData: z.record(z.string(), z.string()).optional(),
 });
 
 export const executeOfframpSchema = z.object({
@@ -473,7 +478,7 @@ export const executeOfframpSchema = z.object({
 
 const simulateLightsparkSandboxTransferPayloadSchema = z.object({
   quoteId: z.string().min(1),
-  currencyCode: z.literal("USD").default("USD"),
+  currencyCode: z.enum(["USD", "USDC"]).default("USD"),
   currencyAmount: z.number().int().positive().optional(),
 });
 
