@@ -25,9 +25,9 @@ INSERT INTO projects (id, organization_id, name, slug, environment, status, crea
     ('prj_test123456789', 'org_test123456789', 'Test Project', 'test-project', 'sandbox', 'active', 'usr_test123456789');
 
 -- Create a test API key
--- Note: This is the SHA-256 hash of "sk_test_abcdefghijklmnopqrstuvwxyz123456",
--- valid when API_KEY_PEPPER is unset (auth falls back to plain SHA-256).
--- In production, use proper random generation and set API_KEY_PEPPER.
+-- key_hash is derived from the documented dev key via Postgres' built-in sha256(),
+-- so the hash can never drift from the key. Auth uses plain SHA-256 when
+-- API_KEY_PEPPER is unset; in production, use a random key and set API_KEY_PEPPER.
 INSERT INTO api_keys (
     id, organization_id, project_id, created_by, name, key_prefix, key_hash,
     role, rate_limit_tier, status
@@ -38,7 +38,7 @@ INSERT INTO api_keys (
     'usr_test123456789',
     'Development Key',
     'sk_test_abc',
-    '6fb8b7885aec26f907283f58ff1dbcdba6512a34fed96bce3f24ad7ba9fbcd71',
+    encode(sha256('sk_test_abcdefghijklmnopqrstuvwxyz123456'::bytea), 'hex'),
     'api_admin',
     'standard',
     'active'
