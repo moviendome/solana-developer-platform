@@ -1,8 +1,8 @@
 /**
  * Fee Payment Adapters Registry
  *
- * Factory functions for creating fee payment adapters.
- * Kora is the primary provider for gasless transactions.
+ * Factory functions for creating fee payment adapters. Native is the default
+ * (no external dependency); Kora is the opt-in gasless/relayer provider.
  */
 
 import type { FeePaymentPort } from "@/services/ports";
@@ -37,10 +37,13 @@ const DEFAULT_KORA_URLS: Record<string, string> = {
 
 /**
  * Create a fee payment adapter from environment variables.
- * Uses Kora if configured, falls back to native adapter.
+ * Defaults to the native adapter when FEE_PAYMENT_PROVIDER is unset, matching
+ * the self-hosted guidance in .dev.vars.example (native = no external
+ * dependency; Kora points at a public relayer endpoint).
+ * Kora is opt-in via FEE_PAYMENT_PROVIDER=kora.
  */
 export function createFeePaymentAdapter(env: Env): FeePaymentPort {
-  const provider = (env.FEE_PAYMENT_PROVIDER ?? "kora") as FeePaymentProviderType;
+  const provider = (env.FEE_PAYMENT_PROVIDER ?? "native") as FeePaymentProviderType;
 
   switch (provider) {
     case "kora":
@@ -48,7 +51,7 @@ export function createFeePaymentAdapter(env: Env): FeePaymentPort {
     case "native":
       return new NativeAdapter(env);
     default:
-      return createKoraAdapter(env);
+      return new NativeAdapter(env);
   }
 }
 
