@@ -67,6 +67,115 @@ export const updateWalletPolicySchema = z.object({
     .string()
     .refine((value) => isDecimalString(value), { message: "Invalid amount format" })
     .optional(),
+  defaultAction: z.enum(["allow", "deny", "approval_required", "review"]).optional(),
+  rules: z
+    .array(
+      z.discriminatedUnion("kind", [
+        z.object({
+          id: z.string().min(1).max(120).optional(),
+          name: z.string().min(1).max(120).optional(),
+          description: z.string().max(500).optional(),
+          action: z
+            .enum(["allow", "deny", "approval_required", "provider_approval_required", "review"])
+            .optional(),
+          kind: z.literal("operation_family"),
+          family: z
+            .enum([
+              "transfer",
+              "payment",
+              "ramp",
+              "issuance",
+              "raw_sign",
+              "program",
+              "provider_admin",
+            ])
+            .optional(),
+          families: z
+            .array(
+              z.enum([
+                "transfer",
+                "payment",
+                "ramp",
+                "issuance",
+                "raw_sign",
+                "program",
+                "provider_admin",
+              ])
+            )
+            .max(20)
+            .optional(),
+        }),
+        z.object({
+          id: z.string().min(1).max(120).optional(),
+          name: z.string().min(1).max(120).optional(),
+          description: z.string().max(500).optional(),
+          action: z
+            .enum(["allow", "deny", "approval_required", "provider_approval_required", "review"])
+            .optional(),
+          kind: z.literal("destination"),
+          allowlist: z.array(solanaAddressSchema("allowlist entry")).max(500).optional(),
+          blocklist: z.array(solanaAddressSchema("blocklist entry")).max(500).optional(),
+          destination: solanaAddressSchema("destination").optional(),
+          destinations: z.array(solanaAddressSchema("destinations entry")).max(500).optional(),
+        }),
+        z.object({
+          id: z.string().min(1).max(120).optional(),
+          name: z.string().min(1).max(120).optional(),
+          description: z.string().max(500).optional(),
+          action: z
+            .enum(["allow", "deny", "approval_required", "provider_approval_required", "review"])
+            .optional(),
+          kind: z.literal("amount"),
+          min: z
+            .string()
+            .refine((value) => isDecimalString(value), { message: "Invalid amount format" })
+            .optional(),
+          max: z
+            .string()
+            .refine((value) => isDecimalString(value), { message: "Invalid amount format" })
+            .optional(),
+          asset: z.string().min(1).max(120).optional(),
+          assets: z.array(z.string().min(1).max(120)).max(100).optional(),
+        }),
+        z.object({
+          id: z.string().min(1).max(120).optional(),
+          name: z.string().min(1).max(120).optional(),
+          description: z.string().max(500).optional(),
+          action: z
+            .enum(["allow", "deny", "approval_required", "provider_approval_required", "review"])
+            .optional(),
+          kind: z.literal("approval"),
+          families: z
+            .array(
+              z.enum([
+                "transfer",
+                "payment",
+                "ramp",
+                "issuance",
+                "raw_sign",
+                "program",
+                "provider_admin",
+              ])
+            )
+            .max(20)
+            .optional(),
+          operationTypes: z.array(z.string().min(1).max(120)).max(100).optional(),
+          assets: z.array(z.string().min(1).max(120)).max(100).optional(),
+          approvalGroupId: z.string().min(1).max(120).optional(),
+        }),
+        z.object({
+          id: z.string().min(1).max(120).optional(),
+          name: z.string().min(1).max(120).optional(),
+          description: z.string().max(500).optional(),
+          action: z
+            .enum(["allow", "deny", "approval_required", "provider_approval_required", "review"])
+            .optional(),
+          kind: z.literal("always"),
+        }),
+      ])
+    )
+    .max(100)
+    .optional(),
 });
 
 export const paymentAmountSchema = z
@@ -140,6 +249,7 @@ export const paymentRecurringPaymentStatusSchema = z.enum([
   "pending_activation",
   "activating",
   "active",
+  "updating",
   "canceling",
   "resuming",
   "paused",
@@ -162,8 +272,35 @@ export const createRecurringPaymentSchema = z.object({
   metadataUri: z.string().url().max(128).optional(),
 });
 
+export const updateRecurringPaymentSchema = z
+  .object({
+    sourceWalletId: z.string().min(1).optional(),
+    counterpartyId: z.string().min(1).optional(),
+    counterpartyAccountId: z.string().min(1).optional(),
+    token: paymentTokenSchema.optional(),
+    amount: paymentAmountSchema.optional(),
+    periodHours: z
+      .number()
+      .int()
+      .positive()
+      .max(24 * 365)
+      .optional(),
+    firstCollectionAt: firstCollectionAtTimestampSchema.nullable().optional(),
+    nextCollectionDueAt: recurringTimestampSchema.nullable().optional(),
+    metadataUri: z.string().url().max(128).nullable().optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, {
+    message: "At least one field must be provided",
+  })
+  .refine((value) => !value.counterpartyId || value.counterpartyAccountId, {
+    message: "counterpartyAccountId is required when counterpartyId changes",
+    path: ["counterpartyAccountId"],
+  });
+
 export const activateRecurringPaymentSchema = z.object({}).strict();
+export const cancelRecurringPaymentSchema = z.object({}).strict();
 export const collectRecurringPaymentSchema = z.object({}).strict();
+export const resumeRecurringPaymentSchema = z.object({}).strict();
 
 export const listRecurringPaymentsQuerySchema = z.object({
   counterpartyId: z.string().min(1).optional(),
@@ -344,36 +481,6 @@ export const listOfframpCurrenciesQuerySchema = z.object({
   provider: rampProviderSchema.optional(),
 });
 
-const bvnkRuleEntitySchema = z.object({
-  type: z.enum(["INDIVIDUAL", "COMPANY"]),
-  customerIdentifier: z.string().min(1),
-  relationshipType: z.enum(["SELF_OWNED", "THIRD_PARTY"]),
-  firstName: z.string().optional(),
-  lastName: z.string().optional(),
-  dateOfBirth: z.string().optional(),
-  legalName: z.string().optional(),
-  registrationNumber: z.string().optional(),
-  address: z
-    .object({
-      addressLine1: z.string(),
-      addressLine2: z.string().optional(),
-      postalCode: z.string().optional(),
-      city: z.string(),
-      countryCode: z.string(),
-      country: z.string(),
-      stateCode: z.string().optional(),
-    })
-    .optional(),
-});
-
-const bvnkComplianceSchema = z.object({
-  partyDetails: z
-    .array(z.record(z.string(), z.unknown()))
-    .min(1, { message: "partyDetails must include at least one entry" })
-    .optional(),
-  ruleEntity: bvnkRuleEntitySchema.optional(),
-});
-
 export const createTransferSchema = z.object({
   projectId: z.string().min(1).optional(),
   source: z.string().min(1),
@@ -421,6 +528,60 @@ export const listTransfersQuerySchema = z.object({
 
 export const priorityFeeSchema = z.enum(["none", "low", "medium", "high", "auto"]);
 
+export const transferBatchIdParamsSchema = z.object({
+  batchId: z.string().min(1),
+});
+
+export const transferBatchStatusSchema = z.enum([
+  "pending",
+  "processing",
+  "confirmed",
+  "failed",
+  "partially_failed",
+  "archived",
+]);
+
+export const transferBatchRecipientStatusSchema = z.enum([
+  "pending",
+  "processing",
+  "confirmed",
+  "failed",
+  "archived",
+]);
+
+export const transferBatchRecipientSchema = z.object({
+  externalId: z.string().min(1).max(256).optional(),
+  counterpartyId: z.string().min(1).optional(),
+  counterpartyAccountId: z.string().min(1),
+  amount: paymentAmountSchema,
+});
+
+export const transferBatchOptionsSchema = z.object({
+  maxRecipientsPerTransaction: z.number().int().min(1).max(64).optional(),
+  priorityFee: priorityFeeSchema.optional(),
+  preflight: z.boolean().optional(),
+});
+
+export const createTransferBatchSchema = z.object({
+  projectId: z.string().min(1).optional(),
+  externalId: z.string().min(1).max(256).optional(),
+  source: z.string().min(1),
+  token: paymentTokenSchema,
+  recipients: z.array(transferBatchRecipientSchema).min(1).max(500),
+  options: transferBatchOptionsSchema.optional(),
+});
+
+export const estimateTransferBatchSchema = createTransferBatchSchema;
+
+export const listTransferBatchesQuerySchema = z.object({
+  wallet: z.string().optional(),
+  token: z.string().optional(),
+  status: transferBatchStatusSchema.optional(),
+  externalId: z.string().min(1).max(256).optional(),
+  page: z.coerce.number().int().positive().default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+});
+
 export const prepareTransferOptionsSchema = z.object({
   priorityFee: priorityFeeSchema.optional(),
   simulate: z.boolean().optional(),
@@ -429,17 +590,6 @@ export const prepareTransferOptionsSchema = z.object({
 export const prepareTransferSchema = createTransferSchema.extend({
   referenceAddress: solanaAddressSchema("referenceAddress").optional(),
   options: prepareTransferOptionsSchema.optional(),
-});
-
-export const executeOnrampSchema = z.object({
-  provider: rampProviderSchema,
-  counterpartyId: z.string().min(1),
-  destinationWallet: z.string().min(1),
-  cryptoToken: rampCurrencyCodeSchema,
-  fiatCurrency: rampFiatCurrencySchema.optional(),
-  fiatAmount: paymentAmountSchema,
-  redirectUrl: z.string().url().optional(),
-  bvnkCompliance: bvnkComplianceSchema.optional(),
 });
 
 export const estimateOnrampSchema = z.object({
@@ -476,7 +626,12 @@ export const submitCounterpartyRequirementsSchema = z.discriminatedUnion("provid
       fiatCurrency: rampFiatCurrencySchema,
       collectedData: z.record(z.string(), z.string()).optional(),
     }),
-    z.object({ provider: z.literal("bvnk"), direction: z.literal("offramp") }),
+    z.object({
+      provider: z.literal("bvnk"),
+      direction: z.literal("offramp"),
+      fiatCurrency: rampFiatCurrencySchema,
+      collectedData: z.record(z.string(), z.string()).optional(),
+    }),
   ]),
   z.discriminatedUnion("direction", [
     z.object({ provider: z.literal("lightspark"), direction: z.literal("onramp") }),
@@ -497,17 +652,6 @@ export const createOfframpQuoteSchema = z.object({
   fiatCurrency: rampFiatCurrencySchema.optional(),
   cryptoAmount: paymentAmountSchema,
   redirectUrl: z.string().url().optional(),
-});
-
-export const executeOfframpSchema = z.object({
-  provider: rampProviderSchema,
-  counterpartyId: z.string().min(1),
-  sourceWallet: z.string().min(1),
-  cryptoToken: rampCurrencyCodeSchema,
-  fiatCurrency: rampFiatCurrencySchema.optional(),
-  cryptoAmount: paymentAmountSchema,
-  redirectUrl: z.string().url().optional(),
-  bvnkCompliance: bvnkComplianceSchema.optional(),
 });
 
 export const moneygramRampEventSchema = z.discriminatedUnion("kind", [

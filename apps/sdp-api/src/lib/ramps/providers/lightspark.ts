@@ -2,16 +2,15 @@ import type {
   Counterparty,
   CounterpartyProviderData,
   LightsparkGridAmount,
-  LightsparkPaymentRampExecution,
   LightsparkPaymentRampInstruction,
+  LightsparkProviderPaymentRampInstruction,
   LightsparkRampSettlement,
   PaymentRampEstimate,
-  PaymentRampExecution,
+  PaymentRampExecutionStatus,
   PaymentRampQuote,
   PaymentRampQuoteCurrency,
   SdpEnvironment,
 } from "@sdp/types";
-import type { RampFiatCurrency } from "@sdp/types/generated/ramp-support";
 import {
   CRYPTO_ASSET_DECIMALS,
   type CryptoAssetSymbol,
@@ -22,7 +21,7 @@ import type { CollectedFieldData, CounterpartyRequirements } from "@sdp/types/ra
 import { formatDecimalAmount, parseDecimalAmount } from "@/lib/amount";
 import { AppError, badRequest, providerNotConfigured, providerUnavailable } from "@/lib/errors";
 import { hashString } from "@/lib/hash";
-import { isAddress } from "@/lib/solana";
+import { assertValidAddress, isAddress } from "@/lib/solana";
 import { verifyWebhookSignature } from "@/lib/webhook-signature";
 import { type ProviderRequestInit, providerFetchJson } from "../fetch";
 import {
@@ -30,7 +29,6 @@ import {
   createProviderRampSupport,
   isSolanaCryptoAsset,
   RAMP_RAIL_DUMPS,
-  rampId,
   requireEnv,
   SOLANA_ASSET_TO_RAIL,
 } from "../shared";
@@ -84,18 +82,25 @@ function normalizeLightsparkCurrencyCode(value: string): string {
   return normalized;
 }
 
-function isCryptoAssetSymbol(value: string): value is CryptoAssetSymbol {
-  return value in CRYPTO_ASSET_DECIMALS;
-}
-
 function getLightsparkCurrencyDecimals(currencyCode: string): number {
   const normalized = currencyCode.trim().toUpperCase();
   if (normalized === "BTC") return 8;
-  if (isCryptoAssetSymbol(normalized)) return CRYPTO_ASSET_DECIMALS[normalized];
+  if (isSolanaCryptoAsset(normalized)) return CRYPTO_ASSET_DECIMALS[normalized];
   throw new AppError(
     "BAD_REQUEST",
     `Unsupported lightspark cryptoToken: ${currencyCode}. Supported values: BTC, ${Object.keys(CRYPTO_ASSET_DECIMALS).join(", ")}`
   );
+}
+
+function assertLightsparkInstructionCryptoAsset(value: string | undefined): CryptoAssetSymbol {
+  if (!value?.trim()) {
+    throw providerUnavailable("Lightspark Solana wallet instruction is missing assetType.");
+  }
+  const normalized = normalizeLightsparkCurrencyCode(value);
+  if (!isSolanaCryptoAsset(normalized)) {
+    throw providerUnavailable(`Lightspark returned unsupported crypto asset: ${normalized}.`);
+  }
+  return normalized;
 }
 
 function assertLightsparkAccountId(value: string, fieldName: string): string {
@@ -119,7 +124,7 @@ function toLightsparkMinorUnitsInteger(value: bigint, fieldName: string): number
   return Number(value);
 }
 
-function mapLightsparkQuoteStatus(status: string | undefined): PaymentRampExecution["status"] {
+function mapLightsparkQuoteStatus(status: string | undefined): PaymentRampExecutionStatus {
   if (!status) return "pending";
   const normalized = status.trim().toUpperCase();
   if (normalized === "COMPLETED") return "completed";
@@ -470,22 +475,6 @@ export interface LightsparkCustomerResolution {
   customerId: string;
 }
 
-export interface LightsparkExecuteOnrampInput {
-  destinationWalletAddress: string;
-  cryptoToken: string;
-  fiatCurrency?: RampFiatCurrency;
-  fiatAmount: string;
-  providerCustomer: LightsparkCustomerResolution;
-}
-
-export interface LightsparkExecuteOfframpInput {
-  sourceWalletAddress: string;
-  cryptoToken: string;
-  fiatCurrency?: RampFiatCurrency;
-  cryptoAmount: string;
-  providerCustomer: LightsparkCustomerResolution;
-}
-
 interface GridCreateCustomerBody {
   platformCustomerId: string;
   customerType: LightsparkCustomerType;
@@ -520,7 +509,16 @@ interface GridCreateQuoteBody {
 }
 
 interface GridPaymentInstruction {
-  accountOrWalletInfo: LightsparkPaymentRampInstruction["accountOrWalletInfo"];
+  accountOrWalletInfo: {
+    accountType: string;
+    accountNumber?: string;
+    routingNumber?: string;
+    paymentRails?: string[];
+    reference?: string;
+    bankName?: string;
+    address?: string;
+    assetType?: string;
+  };
   instructionsNotes?: string;
   isPlatformAccount?: boolean;
 }
@@ -543,14 +541,6 @@ interface GridQuoteResponse {
   receivingCurrency: GridCurrency;
   feesIncluded: number;
   expiresAt: string;
-}
-
-interface GridOfframpQuoteBody {
-  source: { sourceType: "ACCOUNT"; accountId: string; currency: string };
-  destination: { destinationType: "ACCOUNT"; accountId: string; currency: string };
-  lockedCurrencySide: "SENDING" | "RECEIVING";
-  lockedCurrencyAmount: number;
-  description: string;
 }
 
 interface GridExchangeRate {
@@ -591,6 +581,53 @@ function parseGridExchangeRate(response: GridExchangeRatesResponse): GridExchang
     );
   }
   return entry;
+}
+
+function normalizeLightsparkPaymentInstruction(
+  instruction: GridPaymentInstruction
+): LightsparkPaymentRampInstruction {
+  const info = instruction.accountOrWalletInfo;
+  const baseInstruction: LightsparkProviderPaymentRampInstruction = {
+    provider: "lightspark",
+    accountOrWalletInfo: {
+      accountType: info.accountType,
+      accountNumber: info.accountNumber,
+      routingNumber: info.routingNumber,
+      paymentRails: info.paymentRails,
+      reference: info.reference,
+      bankName: info.bankName,
+    },
+    instructionsNotes: instruction.instructionsNotes,
+    isPlatformAccount: instruction.isPlatformAccount,
+  };
+
+  if (info.accountType.toUpperCase() !== "SOLANA_WALLET") {
+    return baseInstruction;
+  }
+  if (!info.address?.trim()) {
+    throw providerUnavailable("Lightspark Solana wallet instruction is missing address.");
+  }
+
+  const cryptoCurrency = assertLightsparkInstructionCryptoAsset(info.assetType);
+  const destinationAddress = assertValidAddress(
+    info.address,
+    "Lightspark Solana wallet instruction address"
+  );
+
+  return {
+    ...baseInstruction,
+    kind: "crypto_deposit",
+    destinationAddress,
+    cryptoCurrency,
+    network: "SOLANA",
+    reference: info.reference,
+    accountOrWalletInfo: {
+      ...baseInstruction.accountOrWalletInfo,
+      accountType: "SOLANA_WALLET",
+      address: destinationAddress,
+      assetType: cryptoCurrency,
+    },
+  };
 }
 
 export interface CreateLightsparkOnrampQuoteInput {
@@ -1266,95 +1303,6 @@ export class LightsparkRampClient implements RampProvider {
     return this.toRampQuote(parseLightsparkQuote(response));
   }
 
-  async executeOnramp(
-    { env, mode }: RampRuntimeContext,
-    input: LightsparkExecuteOnrampInput
-  ): Promise<LightsparkPaymentRampExecution> {
-    const customerId = input.providerCustomer.customerId;
-    const config = readLightsparkConfig(env, mode);
-    const cryptoCurrency = normalizeLightsparkCurrencyCode(input.cryptoToken);
-    const fiatCurrency = input.fiatCurrency ?? "USD";
-    const fiatAmountMinorUnits = toLightsparkMinorUnitsInteger(
-      parseDecimalAmount(input.fiatAmount, 2),
-      "fiatAmount"
-    );
-    const destinationAccountId = await this.resolveOnrampDestinationAccountId(
-      config,
-      customerId,
-      input.destinationWalletAddress,
-      cryptoCurrency
-    );
-
-    const quote = await this.gridOnrampQuote(config, {
-      customerId,
-      destinationAccountId,
-      fiatCurrency,
-      cryptoCurrency,
-      fiatAmountMinorUnits,
-    });
-
-    return {
-      id: rampId("ramp"),
-      provider: "lightspark",
-      status: mapLightsparkQuoteStatus(quote.quoteStatus),
-      paymentInstructions: quote.paymentInstructions,
-      reference: quote.id,
-    };
-  }
-
-  async executeOfframp(
-    { env, mode }: RampRuntimeContext,
-    input: LightsparkExecuteOfframpInput
-  ): Promise<LightsparkPaymentRampExecution> {
-    const sourceAccountId = assertLightsparkAccountId(input.sourceWalletAddress, "sourceWallet");
-    const destinationAccountId = assertLightsparkAccountId(
-      input.providerCustomer.customerId,
-      "providerCustomer.customerId"
-    );
-    const cryptoCurrency = normalizeLightsparkCurrencyCode(input.cryptoToken);
-    const fiatCurrency = input.fiatCurrency ?? "USD";
-    const cryptoAmountMinorUnits = toLightsparkMinorUnitsInteger(
-      parseDecimalAmount(input.cryptoAmount, getLightsparkCurrencyDecimals(cryptoCurrency)),
-      "cryptoAmount"
-    );
-    const config = readLightsparkConfig(env, mode);
-
-    const quoteResponse = await this.request<GridQuoteResponse, GridOfframpQuoteBody>(
-      config,
-      "quotes",
-      {
-        method: "POST",
-        body: {
-          source: { sourceType: "ACCOUNT", accountId: sourceAccountId, currency: cryptoCurrency },
-          destination: {
-            destinationType: "ACCOUNT",
-            accountId: destinationAccountId,
-            currency: fiatCurrency,
-          },
-          lockedCurrencySide: "SENDING",
-          lockedCurrencyAmount: cryptoAmountMinorUnits,
-          description: "SDP offramp",
-        },
-      }
-    );
-    const quote = parseLightsparkQuote(quoteResponse);
-
-    const executedResponse = await this.request<GridQuoteResponse>(
-      config,
-      `quotes/${encodeURIComponent(quote.id)}/execute`,
-      { method: "POST" }
-    );
-    const executedQuote = parseLightsparkQuote(executedResponse);
-
-    return {
-      id: rampId("ramp"),
-      provider: "lightspark",
-      status: mapLightsparkQuoteStatus(executedQuote.quoteStatus),
-      paymentInstructions: executedQuote.paymentInstructions,
-      reference: quote.id,
-    };
-  }
-
   async sandboxSend({ env, mode }: RampRuntimeContext, payload: unknown): Promise<unknown> {
     return this.request<unknown, unknown>(readLightsparkConfig(env, mode), "sandbox/send", {
       method: "POST",
@@ -1367,10 +1315,7 @@ function parseLightsparkQuote(raw: GridQuoteResponse): LightsparkQuote {
   return {
     id: raw.id,
     quoteStatus: raw.quoteStatus,
-    paymentInstructions: raw.paymentInstructions?.map((instruction) => ({
-      provider: "lightspark" as const,
-      ...instruction,
-    })),
+    paymentInstructions: raw.paymentInstructions?.map(normalizeLightsparkPaymentInstruction),
     exchangeRate: raw.exchangeRate,
     totalSendingAmount: raw.totalSendingAmount,
     sendingCurrency: raw.sendingCurrency,

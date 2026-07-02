@@ -99,7 +99,6 @@ const TEST_MOONPAY_ONRAMP_URL = "https://buy-sandbox.moonpay.com";
 const TEST_MOONPAY_OFFRAMP_URL = "https://sell-sandbox.moonpay.com";
 const TEST_LIGHTSPARK_GRID_CLIENT_ID = "lightspark_token_id";
 const TEST_LIGHTSPARK_GRID_CLIENT_SECRET = "lightspark_client_secret";
-const LIGHTSPARK_GRID_API_BASE_URL = "https://api.lightspark.com/grid/2025-10-13";
 const TEST_BVNK_HAWK_AUTH_ID = "bvnk_hawk_auth_id";
 const TEST_BVNK_HAWK_SECRET_KEY = "bvnk_hawk_secret_key";
 const TEST_BVNK_WALLET_ID = "a:24122329329347:HsdJVhW:1";
@@ -111,8 +110,6 @@ const TEST_MAGICBLOCK_SPONSOR_FEE_PAYER = "CrankS2fXgMGvQJ3VBrZmRfGrfogDY6pq5Ycg
 const DEVNET_USDC_MINT = WELL_KNOWN_TOKENS.USDC.mints.devnet;
 const MOONPAY_PARAM_BASE_CURRENCY_AMOUNT = "baseCurrencyAmount";
 const MOONPAY_PARAM_EXTERNAL_CUSTOMER_ID = "externalCustomerId";
-const MOONPAY_PARAM_QUOTE_CURRENCY_CODE = "quoteCurrencyCode";
-const MOONPAY_PARAM_REFUND_WALLET_ADDRESS = "refundWalletAddress";
 
 let originalMoonPaySandboxApiKey: string | undefined;
 let originalMoonPaySandboxSecretKey: string | undefined;
@@ -146,11 +143,6 @@ function assertMoonPaySignature(url: URL): void {
     .update(unsignedUrl.search)
     .digest("base64");
   expect(signature).toBe(expectedSignature);
-}
-
-function lightsparkBasicAuthHeader(): string {
-  const credentials = `${TEST_LIGHTSPARK_GRID_CLIENT_ID}:${TEST_LIGHTSPARK_GRID_CLIENT_SECRET}`;
-  return `Basic ${Buffer.from(credentials, "utf8").toString("base64")}`;
 }
 
 async function seedAuthAndWallet(): Promise<void> {
@@ -579,6 +571,32 @@ async function createRecurringPaymentForActivation(headers: Record<string, strin
   return createBody.data.recurringPayment.id;
 }
 
+async function activateRecurringPaymentForTest(headers: Record<string, string>) {
+  const recurringPaymentId = await createRecurringPaymentForActivation(headers);
+  const activateRes = await app.request(
+    `/v1/payments/recurring-payments/${recurringPaymentId}/activate`,
+    {
+      method: "POST",
+      headers,
+    },
+    env
+  );
+  expect(activateRes.status).toBe(200);
+  const activateBody = (await activateRes.json()) as {
+    data: {
+      recurringPayment: {
+        id: string;
+        status: string;
+        planId: string;
+        subscriptionId: string;
+        nextCollectionDueAt: string;
+      };
+    };
+  };
+  expect(activateBody.data.recurringPayment.status).toBe("active");
+  return activateBody.data.recurringPayment;
+}
+
 describe("Payments routes", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -618,7 +636,14 @@ describe("Payments routes", () => {
     fetchMaybePlanMock.mockResolvedValue({
       exists: true,
       address: address(TEST_SOLANA_ADDRESSES.wallet3),
-      data: { data: { terms: { createdAt: 1_770_000_000n } } },
+      data: {
+        status: subscriptionsProgram.PlanStatus.Active,
+        data: {
+          endTs: 0n,
+          pullers: [address(TEST_SOLANA_ADDRESSES.wallet1)],
+          terms: { createdAt: 1_770_000_000n },
+        },
+      },
     } as Awaited<ReturnType<typeof subscriptionsProgram.fetchMaybePlan>>);
     fetchMaybeSubscriptionAuthorityMock.mockResolvedValue({
       exists: true,
@@ -954,6 +979,664 @@ describe("Payments routes", () => {
       authorizationSignature: activateBody.data.recurringPayment.authorizationSignature,
     });
     expect(signAndSendMock).toHaveBeenCalledTimes(2);
+
+    await getDb(env)
+      .prepare(
+        `UPDATE payment_recurring_payment_activation_attempts
+            SET status = 'processing',
+                stage = 'finalize',
+                updated_at = ?
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(new Date().toISOString(), createBody.data.recurringPayment.id)
+      .run();
+
+    const repairedReplayRes = await app.request(
+      `/v1/payments/recurring-payments/${createBody.data.recurringPayment.id}/activate`,
+      {
+        method: "POST",
+        headers,
+      },
+      env
+    );
+
+    expect(repairedReplayRes.status).toBe(200);
+    expect(signAndSendMock).toHaveBeenCalledTimes(2);
+    const repairedAttempt = await getDb(env)
+      .prepare(
+        `SELECT status, stage
+           FROM payment_recurring_payment_activation_attempts
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(createBody.data.recurringPayment.id)
+      .first<{ status: string; stage: string }>();
+    expect(repairedAttempt).toMatchObject({
+      status: "confirmed",
+      stage: "finalize",
+    });
+  });
+
+  it("updates pending recurring payment terms directly and journals an audit event", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const counterpartyId = await seedCounterparty({
+      externalId: "recurring_pending_update_counterparty",
+    });
+    const counterpartyAccountId = await seedCryptoWalletCounterpartyAccount({
+      counterpartyId,
+      address: TEST_SOLANA_ADDRESSES.wallet2,
+    });
+
+    const createRes = await app.request(
+      "/v1/payments/recurring-payments",
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          sourceWalletId: TEST_WALLET_ID,
+          counterpartyId,
+          counterpartyAccountId,
+          token: DEVNET_USDC_MINT,
+          amount: "25.00",
+          periodHours: 24,
+        }),
+      },
+      env
+    );
+    expect(createRes.status).toBe(201);
+    const createBody = (await createRes.json()) as {
+      data: { recurringPayment: { id: string } };
+    };
+
+    const updateRes = await app.request(
+      `/v1/payments/recurring-payments/${createBody.data.recurringPayment.id}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          amount: "30.50",
+          periodHours: 48,
+          firstCollectionAt: null,
+          metadataUri: "https://example.com/recurring/update.json",
+        }),
+      },
+      env
+    );
+
+    expect(updateRes.status).toBe(200);
+    const updateBody = (await updateRes.json()) as {
+      data: {
+        recurringPayment: {
+          id: string;
+          amount: string;
+          periodHours: number;
+          metadataUri: string | null;
+          status: string;
+        };
+      };
+    };
+    expect(updateBody.data.recurringPayment).toMatchObject({
+      id: createBody.data.recurringPayment.id,
+      amount: "30.50",
+      periodHours: 48,
+      metadataUri: "https://example.com/recurring/update.json",
+      status: "pending_activation",
+    });
+
+    const event = await getDb(env)
+      .prepare(
+        `SELECT changed_fields, before_values, after_values
+           FROM payment_recurring_payment_update_events
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(createBody.data.recurringPayment.id)
+      .first<{
+        changed_fields: string[];
+        before_values: Record<string, unknown>;
+        after_values: Record<string, unknown>;
+      }>();
+    expect(event?.changed_fields).toEqual(expect.arrayContaining(["amount", "periodHours"]));
+    expect(event?.before_values.amount).toBe("25.00");
+    expect(event?.after_values.amount).toBe("30.50");
+  });
+
+  it("updates active recurring payment metadata in place on the existing on-chain plan", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const updatePlanSignature =
+      "4hVxsUpdat3Plan111111111111111111111111111111111111111111111111" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      )
+      .mockResolvedValueOnce(updatePlanSignature);
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const laterPeriodStartAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await getDb(env)
+      .prepare("UPDATE payment_subscriptions SET current_period_start_at = ? WHERE id = ?")
+      .bind(laterPeriodStartAt, activated.subscriptionId)
+      .run();
+
+    const updateRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          metadataUri: "https://example.com/recurring/active.json",
+          nextCollectionDueAt: null,
+        }),
+      },
+      env
+    );
+
+    expect(updateRes.status).toBe(200);
+    const updateBody = (await updateRes.json()) as {
+      data: {
+        recurringPayment: {
+          status: string;
+          planId: string;
+          subscriptionId: string;
+          metadataUri: string | null;
+          nextCollectionDueAt: string;
+        };
+      };
+    };
+    expect(updateBody.data.recurringPayment).toMatchObject({
+      status: "active",
+      planId: activated.planId,
+      subscriptionId: activated.subscriptionId,
+      metadataUri: "https://example.com/recurring/active.json",
+    });
+    expect(updateBody.data.recurringPayment.nextCollectionDueAt).not.toBeNull();
+    expect(signAndSendMock).toHaveBeenCalledTimes(3);
+
+    const attempt = await getDb(env)
+      .prepare(
+        `SELECT mode, status, stage, plan_update_signature
+           FROM payment_recurring_payment_update_attempts
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(activated.id)
+      .first<{
+        mode: string;
+        status: string;
+        stage: string;
+        plan_update_signature: string | null;
+      }>();
+    expect(attempt).toMatchObject({
+      mode: "metadata_schedule",
+      status: "confirmed",
+      stage: "finalize",
+      plan_update_signature: updatePlanSignature,
+    });
+    const event = await getDb(env)
+      .prepare(
+        `SELECT after_values
+           FROM payment_recurring_payment_update_events
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(activated.id)
+      .first<{ after_values: Record<string, unknown> }>();
+    expect(event?.after_values.nextCollectionDueAt).toBe(
+      updateBody.data.recurringPayment.nextCollectionDueAt
+    );
+  });
+
+  it("replaces active recurring payment records for term changes and cancels the old subscription", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const replacementPlanSignature =
+      "4hVxsReplac3Plan11111111111111111111111111111111111111111111" as Signature;
+    const replacementAuthSignature =
+      "4hVxsReplac3Auth11111111111111111111111111111111111111111111" as Signature;
+    const oldCancelSignature =
+      "4hVxsOldCanc3l111111111111111111111111111111111111111111111" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      )
+      .mockResolvedValueOnce(replacementPlanSignature)
+      .mockResolvedValueOnce(replacementAuthSignature)
+      .mockResolvedValueOnce(oldCancelSignature);
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const firstCollectionAt = "2026-07-02T00:00:00.000Z";
+    await getDb(env)
+      .prepare("UPDATE payment_recurring_payments SET first_collection_at = ? WHERE id = ?")
+      .bind(firstCollectionAt, activated.id)
+      .run();
+
+    const updateRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ amount: "35.00", periodHours: 48, nextCollectionDueAt: null }),
+      },
+      env
+    );
+
+    expect(updateRes.status).toBe(200);
+    const updateBody = (await updateRes.json()) as {
+      data: {
+        recurringPayment: {
+          status: string;
+          amount: string;
+          periodHours: number;
+          planId: string;
+          subscriptionId: string;
+          authorizationSignature: string;
+          nextCollectionDueAt: string;
+        };
+      };
+    };
+    expect(updateBody.data.recurringPayment).toMatchObject({
+      status: "active",
+      amount: "35.00",
+      periodHours: 48,
+      authorizationSignature: replacementAuthSignature,
+    });
+    expect(updateBody.data.recurringPayment.nextCollectionDueAt).not.toBeNull();
+    expect(updateBody.data.recurringPayment.planId).not.toBe(activated.planId);
+    expect(updateBody.data.recurringPayment.subscriptionId).not.toBe(activated.subscriptionId);
+    expect(signAndSendMock).toHaveBeenCalledTimes(5);
+
+    const oldSubscription = await getDb(env)
+      .prepare("SELECT status FROM payment_subscriptions WHERE id = ?")
+      .bind(activated.subscriptionId)
+      .first<{ status: string }>();
+    const oldPlan = await getDb(env)
+      .prepare("SELECT status FROM payment_subscription_plans WHERE id = ?")
+      .bind(activated.planId)
+      .first<{ status: string }>();
+    const attempt = await getDb(env)
+      .prepare(
+        `SELECT mode, status, stage, plan_creation_signature, authorization_signature, old_cancel_signature
+           FROM payment_recurring_payment_update_attempts
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(activated.id)
+      .first<{
+        mode: string;
+        status: string;
+        stage: string;
+        plan_creation_signature: string | null;
+        authorization_signature: string | null;
+        old_cancel_signature: string | null;
+      }>();
+    expect(oldSubscription?.status).toBe("canceled");
+    expect(oldPlan?.status).toBe("archived");
+    expect(attempt).toMatchObject({
+      mode: "replacement",
+      status: "confirmed",
+      stage: "finalize",
+      plan_creation_signature: replacementPlanSignature,
+      authorization_signature: replacementAuthSignature,
+      old_cancel_signature: oldCancelSignature,
+    });
+    const event = await getDb(env)
+      .prepare(
+        `SELECT changed_fields, before_values, after_values
+           FROM payment_recurring_payment_update_events
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(activated.id)
+      .first<{
+        changed_fields: string[];
+        before_values: Record<string, unknown>;
+        after_values: Record<string, unknown>;
+      }>();
+    expect(event?.changed_fields).toContain("firstCollectionAt");
+    expect(event?.changed_fields).toContain("nextCollectionDueAt");
+    expect(event?.before_values.firstCollectionAt).toBe(firstCollectionAt);
+    expect(event?.after_values.firstCollectionAt).toBeNull();
+    expect(event?.after_values.nextCollectionDueAt).toBe(
+      updateBody.data.recurringPayment.nextCollectionDueAt
+    );
+  });
+
+  it("rejects active replacement next due dates before replacement transactions are submitted", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      );
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const tooEarlyNextDue = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+    const updateRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          amount: "35.00",
+          periodHours: 48,
+          nextCollectionDueAt: tooEarlyNextDue,
+        }),
+      },
+      env
+    );
+
+    expect(updateRes.status).toBe(400);
+    const body = (await updateRes.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("replacement subscription period");
+    expect(signAndSendMock).toHaveBeenCalledTimes(2);
+
+    const recurringPayment = await getDb(env)
+      .prepare("SELECT status FROM payment_recurring_payments WHERE id = ?")
+      .bind(activated.id)
+      .first<{ status: string }>();
+    const attempt = await getDb(env)
+      .prepare(
+        `SELECT status, error, plan_creation_signature, authorization_signature, old_cancel_signature
+           FROM payment_recurring_payment_update_attempts
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(activated.id)
+      .first<{
+        status: string;
+        error: string | null;
+        plan_creation_signature: string | null;
+        authorization_signature: string | null;
+        old_cancel_signature: string | null;
+      }>();
+    expect(recurringPayment?.status).toBe("active");
+    expect(attempt).toMatchObject({
+      status: "failed",
+      plan_creation_signature: null,
+      authorization_signature: null,
+      old_cancel_signature: null,
+    });
+    expect(attempt?.error).toContain("replacement subscription period");
+  });
+
+  it("rejects fresh in-flight recurring payment updates", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const recurringPaymentId = await createRecurringPaymentForActivation(headers);
+    await getDb(env)
+      .prepare("UPDATE payment_recurring_payments SET status = 'updating' WHERE id = ?")
+      .bind(recurringPaymentId)
+      .run();
+
+    const updateRes = await app.request(
+      `/v1/payments/recurring-payments/${recurringPaymentId}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ metadataUri: "https://example.com/recurring/wait.json" }),
+      },
+      env
+    );
+
+    expect(updateRes.status).toBe(409);
+    const body = (await updateRes.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("already processing");
+  });
+
+  it("rejects stale recurring payment update recovery with a different payload", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      );
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const staleAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+
+    await getDb(env)
+      .prepare(
+        "UPDATE payment_recurring_payments SET status = 'updating', updated_at = ? WHERE id = ?"
+      )
+      .bind(staleAt, activated.id)
+      .run();
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_recurring_payment_update_attempts (
+           id,
+           organization_id,
+           project_id,
+           recurring_payment_id,
+           mode,
+           status,
+           stage,
+           old_plan_id,
+           old_subscription_id,
+           changed_fields,
+           before_values,
+           after_values,
+           created_at,
+           updated_at
+         ) VALUES (
+           'prpu_stale_payload_mismatch',
+           ?, ?, ?, 'replacement', 'processing', 'create_plan', ?, ?,
+           ARRAY['amount']::text[], ?::jsonb, ?::jsonb, ?, ?
+         )`
+      )
+      .bind(
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        activated.id,
+        activated.planId,
+        activated.subscriptionId,
+        JSON.stringify({ amount: "25.00" }),
+        JSON.stringify({ amount: "35.00" }),
+        staleAt,
+        staleAt
+      )
+      .run();
+
+    const updateRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ amount: "36.00" }),
+      },
+      env
+    );
+
+    expect(updateRes.status).toBe(409);
+    const body = (await updateRes.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("retry the same update");
+    expect(signAndSendMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("clamps stale metadata update retries after the subscription period advances", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const planCreationSignature =
+      "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature;
+    const authorizationSignature =
+      "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature;
+    const updatePlanSignature =
+      "3agLAsjf2Qba9W59cqxbXFoPRJFDFKB3efqYRhT6wLxaM4KwV31NVrLDjKAw22hR1GFcQc4mePSjZ6XZEHUAjN4c" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(planCreationSignature)
+      .mockResolvedValueOnce(authorizationSignature);
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const staleAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    const requestedNextDueAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const advancedPeriodStartAt = new Date().toISOString();
+    const expectedClampedDueAt = new Date(
+      new Date(advancedPeriodStartAt).getTime() + 24 * 60 * 60 * 1000
+    ).toISOString();
+    const metadataUri = "https://example.com/recurring/recovered.json";
+
+    await getDb(env)
+      .prepare(
+        "UPDATE payment_recurring_payments SET status = 'updating', updated_at = ? WHERE id = ?"
+      )
+      .bind(staleAt, activated.id)
+      .run();
+    await getDb(env)
+      .prepare("UPDATE payment_subscriptions SET current_period_start_at = ? WHERE id = ?")
+      .bind(advancedPeriodStartAt, activated.subscriptionId)
+      .run();
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_recurring_payment_update_attempts (
+           id,
+           organization_id,
+           project_id,
+           recurring_payment_id,
+           mode,
+           status,
+           stage,
+           old_plan_id,
+           old_subscription_id,
+           plan_update_signature,
+           changed_fields,
+           before_values,
+           after_values,
+           created_at,
+           updated_at
+         ) VALUES (
+           'prpu_stale_metadata_schedule_recovery',
+           ?, ?, ?, 'metadata_schedule', 'processing', 'update_plan', ?, ?, ?,
+           ARRAY['nextCollectionDueAt', 'metadataUri']::text[], ?::jsonb, ?::jsonb, ?, ?
+         )`
+      )
+      .bind(
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        activated.id,
+        activated.planId,
+        activated.subscriptionId,
+        updatePlanSignature,
+        JSON.stringify({ nextCollectionDueAt: activated.nextCollectionDueAt, metadataUri: null }),
+        JSON.stringify({ nextCollectionDueAt: requestedNextDueAt, metadataUri }),
+        staleAt,
+        staleAt
+      )
+      .run();
+
+    const updateRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}`,
+      {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({ metadataUri, nextCollectionDueAt: requestedNextDueAt }),
+      },
+      env
+    );
+
+    expect(updateRes.status).toBe(200);
+    const updateBody = (await updateRes.json()) as {
+      data: {
+        recurringPayment: {
+          status: string;
+          metadataUri: string;
+          nextCollectionDueAt: string;
+        };
+      };
+    };
+    expect(updateBody.data.recurringPayment).toMatchObject({
+      status: "active",
+      metadataUri,
+      nextCollectionDueAt: expectedClampedDueAt,
+    });
+    expect(signAndSendMock).toHaveBeenCalledTimes(2);
+
+    const event = await getDb(env)
+      .prepare(
+        `SELECT after_values
+           FROM payment_recurring_payment_update_events
+          WHERE recurring_payment_id = ?`
+      )
+      .bind(activated.id)
+      .first<{ after_values: Record<string, unknown> }>();
+    expect(event?.after_values.nextCollectionDueAt).toBe(expectedClampedDueAt);
   });
 
   it("creates the source token account during recurring payment activation when it is missing", async () => {
@@ -1010,6 +1693,670 @@ describe("Payments routes", () => {
       .bind(activateBody.data.recurringPayment.subscriptionId)
       .first<{ subscriber_token_account: string | null }>();
     expect(subscriptionRow?.subscriber_token_account).toBe(expectedSourceAta);
+  });
+
+  it("cancels active recurring payments through SDP API routes", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const cancelSignature =
+      "3hdAMf5sGEHn2UAjViFvX9YtZQdRfeHEGwNEc8GjVKFG5MGNs27jVrNuQXHcr1JAkzjcJtS4Lo6z33Z5fbT2gq13" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      )
+      .mockResolvedValueOnce(cancelSignature);
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+
+    const cancelRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(cancelRes.status).toBe(200);
+    const cancelBody = (await cancelRes.json()) as {
+      data: { recurringPayment: { id: string; status: string } };
+    };
+    expect(cancelBody.data.recurringPayment).toMatchObject({
+      id: activated.id,
+      status: "canceled",
+    });
+    const lifecycleAttempt = await getDb(env)
+      .prepare(
+        `SELECT operation, status, stage, signature
+           FROM payment_recurring_payment_lifecycle_attempts
+          WHERE recurring_payment_id = ?
+          ORDER BY created_at DESC`
+      )
+      .bind(activated.id)
+      .first<{ operation: string; status: string; stage: string; signature: string | null }>();
+    expect(lifecycleAttempt).toMatchObject({
+      operation: "cancel",
+      status: "confirmed",
+      stage: "finalize",
+      signature: cancelSignature,
+    });
+    const subscriptionRow = await getDb(env)
+      .prepare("SELECT status, cancel_at, canceled_at FROM payment_subscriptions WHERE id = ?")
+      .bind(activated.subscriptionId)
+      .first<{ status: string; cancel_at: string | null; canceled_at: string | null }>();
+    expect(subscriptionRow?.status).toBe("canceled");
+    expect(subscriptionRow?.cancel_at).toBeTruthy();
+    expect(subscriptionRow?.canceled_at).toBeTruthy();
+
+    const replayRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(replayRes.status).toBe(200);
+    const replayBody = (await replayRes.json()) as {
+      data: { recurringPayment: { id: string; status: string } };
+    };
+    expect(replayBody.data.recurringPayment).toMatchObject({
+      id: activated.id,
+      status: "canceled",
+    });
+    expect(signAndSendMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("resumes canceled recurring payments through SDP API routes", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const cancelSignature =
+      "3hdAMf5sGEHn2UAjViFvX9YtZQdRfeHEGwNEc8GjVKFG5MGNs27jVrNuQXHcr1JAkzjcJtS4Lo6z33Z5fbT2gq13" as Signature;
+    const resumeSignature =
+      "4rNhfL5s9hQfCjVxrTQDAZECJ5M99kzF8JRgWEzZEijj73D4Jsiz82cgwxUc71vWR9NBdk2zX9qQREx9UvP4QREe" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      )
+      .mockResolvedValueOnce(cancelSignature)
+      .mockResolvedValueOnce(resumeSignature);
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const cancelRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+    expect(cancelRes.status).toBe(200);
+
+    const resumeRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/resume`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(resumeRes.status).toBe(200);
+    const resumeBody = (await resumeRes.json()) as {
+      data: { recurringPayment: { id: string; status: string } };
+    };
+    expect(resumeBody.data.recurringPayment).toMatchObject({
+      id: activated.id,
+      status: "active",
+    });
+    const lifecycleAttempt = await getDb(env)
+      .prepare(
+        `SELECT operation, status, stage, signature
+           FROM payment_recurring_payment_lifecycle_attempts
+          WHERE recurring_payment_id = ? AND operation = 'resume'
+          ORDER BY created_at DESC`
+      )
+      .bind(activated.id)
+      .first<{ operation: string; status: string; stage: string; signature: string | null }>();
+    expect(lifecycleAttempt).toMatchObject({
+      operation: "resume",
+      status: "confirmed",
+      stage: "finalize",
+      signature: resumeSignature,
+    });
+    const subscriptionRow = await getDb(env)
+      .prepare("SELECT status, cancel_at, canceled_at FROM payment_subscriptions WHERE id = ?")
+      .bind(activated.subscriptionId)
+      .first<{ status: string; cancel_at: string | null; canceled_at: string | null }>();
+    expect(subscriptionRow).toMatchObject({
+      status: "active",
+      cancel_at: null,
+      canceled_at: null,
+    });
+
+    const replayRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/resume`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(replayRes.status).toBe(200);
+    expect(signAndSendMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("recovers submitted recurring payment cancel attempts", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const cancelSignature =
+      "3hdAMf5sGEHn2UAjViFvX9YtZQdRfeHEGwNEc8GjVKFG5MGNs27jVrNuQXHcr1JAkzjcJtS4Lo6z33Z5fbT2gq13" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      );
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const staleUpdatedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    const attemptId = `prpl_${crypto.randomUUID()}`;
+    await getDb(env)
+      .prepare(
+        "UPDATE payment_recurring_payments SET status = 'canceling', updated_at = ? WHERE id = ?"
+      )
+      .bind(staleUpdatedAt, activated.id)
+      .run();
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_recurring_payment_lifecycle_attempts (
+           id,
+           organization_id,
+           project_id,
+           recurring_payment_id,
+           operation,
+           status,
+           stage,
+           signature,
+           metadata,
+           created_at,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)`
+      )
+      .bind(
+        attemptId,
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        activated.id,
+        "cancel",
+        "processing",
+        "submit",
+        cancelSignature,
+        JSON.stringify({}),
+        staleUpdatedAt,
+        staleUpdatedAt
+      )
+      .run();
+
+    const cancelRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(cancelRes.status).toBe(200);
+    const cancelBody = (await cancelRes.json()) as {
+      data: { recurringPayment: { status: string } };
+    };
+    expect(cancelBody.data.recurringPayment.status).toBe("canceled");
+    expect(signAndSendMock).toHaveBeenCalledTimes(2);
+    expect(confirmTransactionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      cancelSignature,
+      expect.objectContaining({ commitment: "confirmed" })
+    );
+    const recoveredAttempt = await getDb(env)
+      .prepare(
+        "SELECT status, stage, signature FROM payment_recurring_payment_lifecycle_attempts WHERE id = ?"
+      )
+      .bind(attemptId)
+      .first<{ status: string; stage: string; signature: string | null }>();
+    expect(recoveredAttempt).toMatchObject({
+      status: "confirmed",
+      stage: "finalize",
+      signature: cancelSignature,
+    });
+  });
+
+  it("recovers submitted recurring payment resume attempts", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const cancelSignature =
+      "3hdAMf5sGEHn2UAjViFvX9YtZQdRfeHEGwNEc8GjVKFG5MGNs27jVrNuQXHcr1JAkzjcJtS4Lo6z33Z5fbT2gq13" as Signature;
+    const resumeSignature =
+      "4rNhfL5s9hQfCjVxrTQDAZECJ5M99kzF8JRgWEzZEijj73D4Jsiz82cgwxUc71vWR9NBdk2zX9qQREx9UvP4QREe" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      )
+      .mockResolvedValueOnce(cancelSignature);
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const cancelRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+    expect(cancelRes.status).toBe(200);
+
+    const staleUpdatedAt = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+    const attemptId = `prpl_${crypto.randomUUID()}`;
+    await getDb(env)
+      .prepare(
+        "UPDATE payment_recurring_payments SET status = 'resuming', updated_at = ? WHERE id = ?"
+      )
+      .bind(staleUpdatedAt, activated.id)
+      .run();
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_recurring_payment_lifecycle_attempts (
+           id,
+           organization_id,
+           project_id,
+           recurring_payment_id,
+           operation,
+           status,
+           stage,
+           signature,
+           metadata,
+           created_at,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)`
+      )
+      .bind(
+        attemptId,
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        activated.id,
+        "resume",
+        "processing",
+        "submit",
+        resumeSignature,
+        JSON.stringify({}),
+        staleUpdatedAt,
+        staleUpdatedAt
+      )
+      .run();
+
+    const resumeRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/resume`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(resumeRes.status).toBe(200);
+    const resumeBody = (await resumeRes.json()) as {
+      data: { recurringPayment: { status: string } };
+    };
+    expect(resumeBody.data.recurringPayment.status).toBe("active");
+    expect(signAndSendMock).toHaveBeenCalledTimes(3);
+    expect(confirmTransactionMock).toHaveBeenCalledWith(
+      expect.anything(),
+      resumeSignature,
+      expect.objectContaining({ commitment: "confirmed" })
+    );
+    const recoveredAttempt = await getDb(env)
+      .prepare(
+        "SELECT status, stage, signature FROM payment_recurring_payment_lifecycle_attempts WHERE id = ?"
+      )
+      .bind(attemptId)
+      .first<{ status: string; stage: string; signature: string | null }>();
+    expect(recoveredAttempt).toMatchObject({
+      status: "confirmed",
+      stage: "finalize",
+      signature: resumeSignature,
+    });
+  });
+
+  it("blocks recurring payment cancellation while a fresh collection is processing", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      );
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const dueAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const now = new Date().toISOString();
+    await getDb(env)
+      .prepare("UPDATE payment_recurring_payments SET next_collection_due_at = ? WHERE id = ?")
+      .bind(dueAt, activated.id)
+      .run();
+    await getDb(env)
+      .prepare("UPDATE payment_subscriptions SET next_collection_due_at = ? WHERE id = ?")
+      .bind(dueAt, activated.subscriptionId)
+      .run();
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_subscription_collection_attempts (
+           id,
+           organization_id,
+           project_id,
+           subscription_id,
+           transfer_id,
+           token,
+           amount,
+           due_at,
+           attempted_at,
+           status,
+           metadata,
+           created_at,
+           updated_at
+         ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)`
+      )
+      .bind(
+        `psca_${crypto.randomUUID()}`,
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        activated.subscriptionId,
+        DEVNET_USDC_MINT,
+        "25.00",
+        dueAt,
+        now,
+        "processing",
+        JSON.stringify({ recurringPaymentId: activated.id }),
+        now,
+        now
+      )
+      .run();
+
+    const cancelRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(cancelRes.status).toBe(409);
+    const row = await getDb(env)
+      .prepare("SELECT status FROM payment_recurring_payments WHERE id = ?")
+      .bind(activated.id)
+      .first<{ status: string }>();
+    expect(row?.status).toBe("active");
+    expect(signAndSendMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("resets recurring payment cancellation claims when subscription validation fails", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      );
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    await getDb(env)
+      .prepare("UPDATE payment_subscriptions SET status = 'paused' WHERE id = ?")
+      .bind(activated.subscriptionId)
+      .run();
+
+    const cancelRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(cancelRes.status).toBe(409);
+    const cancelBody = (await cancelRes.json()) as { error: { message: string } };
+    expect(cancelBody.error.message).toContain("Subscription cannot be canceled");
+    const row = await getDb(env)
+      .prepare("SELECT status FROM payment_recurring_payments WHERE id = ?")
+      .bind(activated.id)
+      .first<{ status: string }>();
+    expect(row?.status).toBe("active");
+    const lifecycleAttempt = await getDb(env)
+      .prepare(
+        `SELECT operation, status, stage, error
+           FROM payment_recurring_payment_lifecycle_attempts
+          WHERE recurring_payment_id = ?
+          ORDER BY created_at DESC`
+      )
+      .bind(activated.id)
+      .first<{ operation: string; status: string; stage: string; error: string | null }>();
+    expect(lifecycleAttempt).toMatchObject({
+      operation: "cancel",
+      status: "failed",
+      stage: "claim",
+    });
+    expect(lifecycleAttempt?.error).toContain("Subscription cannot be canceled");
+    expect(signAndSendMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("recovers confirmed recurring payment collections before cancellation", async () => {
+    env.PAYMENTS_RECURRING_ENABLED = "true";
+    const sourceSigner = await generateKeyPairSigner();
+    await updateSeededWalletPublicKey(sourceSigner.address);
+    createOrgSignerMock.mockResolvedValue(sourceSigner);
+    mockRecurringActivationRpc();
+    const collectionSignature =
+      "3hdAMf5sGEHn2UAjViFvX9YtZQdRfeHEGwNEc8GjVKFG5MGNs27jVrNuQXHcr1JAkzjcJtS4Lo6z33Z5fbT2gq13" as Signature;
+    const cancelSignature =
+      "4rNhfL5s9hQfCjVxrTQDAZECJ5M99kzF8JRgWEzZEijj73D4Jsiz82cgwxUc71vWR9NBdk2zX9qQREx9UvP4QREe" as Signature;
+    const signAndSendMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy" as Signature
+      )
+      .mockResolvedValueOnce(
+        "5Tzxe7r8pab72bTDx9pQHM9YEWXoQ2MchfbzdnJAj3vScaUmAAJgEE3Jx1b68u33cfWdJTKXgpUtHBZPYJxVQ1pV" as Signature
+      )
+      .mockResolvedValueOnce(cancelSignature);
+    createFeePaymentAdapterMock.mockReturnValue({
+      providerId: "mock",
+      getFeePayer: vi.fn().mockResolvedValue(TEST_KORA_FEE_PAYER),
+      signAsFeePayer: vi.fn(),
+      signAndSend: signAndSendMock,
+    } as ReturnType<typeof feePaymentAdapters.createFeePaymentAdapter>);
+    const headers = {
+      Authorization: `Bearer ${TEST_API_KEY.raw}`,
+      "Content-Type": "application/json",
+    };
+    const activated = await activateRecurringPaymentForTest(headers);
+    const dueAt = new Date(Date.now() - 60 * 1000).toISOString();
+    const now = new Date().toISOString();
+    const transferId = `xfr_${crypto.randomUUID()}`;
+    const attemptId = `psca_${crypto.randomUUID()}`;
+    await getDb(env)
+      .prepare("UPDATE payment_recurring_payments SET next_collection_due_at = ? WHERE id = ?")
+      .bind(dueAt, activated.id)
+      .run();
+    await getDb(env)
+      .prepare("UPDATE payment_subscriptions SET next_collection_due_at = ? WHERE id = ?")
+      .bind(dueAt, activated.subscriptionId)
+      .run();
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_transfers (
+           id,
+           organization_id,
+           project_id,
+           wallet_id,
+           counterparty_id,
+           source_address,
+           destination_address,
+           token,
+           amount,
+           memo,
+           type,
+           direction,
+           status,
+           provider_data,
+           signature,
+           created_at,
+           updated_at
+         ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, ?, ?, ?, ?::jsonb, ?, ?, ?)`
+      )
+      .bind(
+        transferId,
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        TEST_WALLET_ID,
+        sourceSigner.address,
+        TEST_SOLANA_ADDRESSES.wallet2,
+        DEVNET_USDC_MINT,
+        "25.00",
+        "transfer",
+        "outbound",
+        "confirmed",
+        JSON.stringify({ recurringPaymentId: activated.id }),
+        collectionSignature,
+        now,
+        now
+      )
+      .run();
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_subscription_collection_attempts (
+           id,
+           organization_id,
+           project_id,
+           subscription_id,
+           transfer_id,
+           token,
+           amount,
+           due_at,
+           attempted_at,
+           status,
+           signature,
+           metadata,
+           created_at,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)`
+      )
+      .bind(
+        attemptId,
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        activated.subscriptionId,
+        transferId,
+        DEVNET_USDC_MINT,
+        "25.00",
+        dueAt,
+        now,
+        "confirmed",
+        collectionSignature,
+        JSON.stringify({ recurringPaymentId: activated.id }),
+        now,
+        now
+      )
+      .run();
+
+    const cancelRes = await app.request(
+      `/v1/payments/recurring-payments/${activated.id}/cancel`,
+      { method: "POST", headers },
+      env
+    );
+
+    expect(cancelRes.status).toBe(200);
+    const cancelBody = (await cancelRes.json()) as {
+      data: { recurringPayment: { status: string; nextCollectionDueAt: string } };
+    };
+    expect(cancelBody.data.recurringPayment.status).toBe("canceled");
+    expect(new Date(cancelBody.data.recurringPayment.nextCollectionDueAt).getTime()).toBe(
+      new Date(dueAt).getTime() + 24 * 60 * 60 * 1000
+    );
+    const recoveredAttempt = await getDb(env)
+      .prepare(
+        "SELECT status, signature FROM payment_subscription_collection_attempts WHERE id = ?"
+      )
+      .bind(attemptId)
+      .first<{ status: string; signature: string | null }>();
+    expect(recoveredAttempt).toMatchObject({
+      status: "confirmed",
+      signature: collectionSignature,
+    });
+    expect(signAndSendMock).toHaveBeenCalledTimes(3);
   });
 
   it("collects due recurring payments through SDP API routes", async () => {
@@ -2573,6 +3920,39 @@ describe("Payments routes", () => {
         createBody.data.recurringPayment.id
       )
       .run();
+    const attemptId = `prpa_${crypto.randomUUID()}`;
+    await getDb(env)
+      .prepare(
+        `INSERT INTO payment_recurring_payment_activation_attempts (
+           id,
+           organization_id,
+           project_id,
+           recurring_payment_id,
+           status,
+           stage,
+           plan_creation_signature,
+           authorization_signature,
+           error,
+           metadata,
+           created_at,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)`
+      )
+      .bind(
+        attemptId,
+        TEST_ORG.id,
+        TEST_PROJECT.id,
+        createBody.data.recurringPayment.id,
+        "processing",
+        "create_plan",
+        "4hXTCkRzt9WyecNzV1XPgCDfGAZzQKNxLXgynz5QDuWJ5NFkqjAvuA3P73N5MtZ7e8KQLD6tPBm53RsNkUqJZiy",
+        null,
+        null,
+        "{}",
+        now,
+        now
+      )
+      .run();
 
     const freshRetryRes = await app.request(
       `/v1/payments/recurring-payments/${createBody.data.recurringPayment.id}/activate`,
@@ -2604,6 +3984,28 @@ describe("Payments routes", () => {
       authorizationSignature,
     });
     expect(signAndSendMock).toHaveBeenCalledTimes(1);
+    const recoveredAttempts = await getDb(env)
+      .prepare(
+        `SELECT id, status, stage, plan_creation_signature, authorization_signature
+           FROM payment_recurring_payment_activation_attempts
+          WHERE recurring_payment_id = ?
+          ORDER BY created_at DESC`
+      )
+      .bind(createBody.data.recurringPayment.id)
+      .all<{
+        id: string;
+        status: string;
+        stage: string;
+        plan_creation_signature: string | null;
+        authorization_signature: string | null;
+      }>();
+    expect(recoveredAttempts.results).toHaveLength(1);
+    expect(recoveredAttempts.results[0]).toMatchObject({
+      id: attemptId,
+      status: "confirmed",
+      stage: "finalize",
+      authorization_signature: authorizationSignature,
+    });
   });
 
   it("recovers stale authorized recurring payments without re-confirming old signatures", async () => {
@@ -3985,51 +5387,6 @@ describe("Payments routes", () => {
     });
   });
 
-  it("creates a signed MoonPay on-ramp session URL", async () => {
-    const counterpartyId = await seedCounterparty();
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-forwarded-for": "1.1.1.1",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId,
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "120.50",
-          redirectUrl: "https://example.com/onramp-done",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: { ramp: { id: string; status: string; redirectUrl: string } };
-    };
-
-    expect(body.data.ramp.id.startsWith("ramp_")).toBe(true);
-    expect(body.data.ramp.status).toBe("pending");
-
-    const redirect = new URL(body.data.ramp.redirectUrl);
-    expect(redirect.origin).toBe(TEST_MOONPAY_ONRAMP_URL);
-    expect(redirect.searchParams.get("apiKey")).toBe(TEST_MOONPAY_API_KEY);
-    expect(redirect.searchParams.get("baseCurrencyCode")).toBe("usd");
-    expect(redirect.searchParams.get(MOONPAY_PARAM_BASE_CURRENCY_AMOUNT)).toBe("120.50");
-    expect(redirect.searchParams.get("currencyCode")).toBe("usdc_sol");
-    expect(redirect.searchParams.get("walletAddress")).toBe(TEST_SOLANA_ADDRESSES.wallet1);
-    expect(redirect.searchParams.get("redirectURL")).toBe("https://example.com/onramp-done");
-    expect(redirect.searchParams.get(MOONPAY_PARAM_EXTERNAL_CUSTOMER_ID)).toBeNull();
-    assertMoonPaySignature(redirect);
-  });
-
   it("creates a hosted MoonPay on-ramp quote URL", async () => {
     const counterpartyId = await seedCounterparty({ externalId: "moonpay_user_123" });
 
@@ -4085,737 +5442,45 @@ describe("Payments routes", () => {
     assertMoonPaySignature(hostedUrl);
   });
 
-  it("creates a signed MoonPay off-ramp session URL", async () => {
-    const counterpartyId = await seedCounterparty();
-
-    const res = await app.request(
-      "/v1/payments/ramps/offramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId,
-          sourceWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          cryptoAmount: "75.25",
-          redirectUrl: "https://example.com/offramp-done",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: { ramp: { id: string; status: string; redirectUrl: string; reference: string } };
-    };
-
-    expect(body.data.ramp.id.startsWith("ramp_")).toBe(true);
-    expect(body.data.ramp.status).toBe("pending");
-    expect(body.data.ramp.reference.startsWith("sdp_offramp_")).toBe(true);
-
-    const redirect = new URL(body.data.ramp.redirectUrl);
-    expect(redirect.origin).toBe(TEST_MOONPAY_OFFRAMP_URL);
-    expect(redirect.searchParams.get("apiKey")).toBe(TEST_MOONPAY_API_KEY);
-    expect(redirect.searchParams.get("baseCurrencyCode")).toBe("usdc_sol");
-    expect(redirect.searchParams.get(MOONPAY_PARAM_BASE_CURRENCY_AMOUNT)).toBe("75.25");
-    expect(redirect.searchParams.get(MOONPAY_PARAM_QUOTE_CURRENCY_CODE)).toBe("usd");
-    expect(redirect.searchParams.get(MOONPAY_PARAM_REFUND_WALLET_ADDRESS)).toBe(
-      TEST_SOLANA_ADDRESSES.wallet1
-    );
-    expect(redirect.searchParams.get("redirectURL")).toBe("https://example.com/offramp-done");
-    expect(redirect.searchParams.get(MOONPAY_PARAM_EXTERNAL_CUSTOMER_ID)).toBeNull();
-    assertMoonPaySignature(redirect);
-  });
-
-  it("blocks MoonPay off-ramp when the wallet policy maxTransferAmount is exceeded", async () => {
-    const counterpartyId = await seedCounterparty();
-    await seedWalletPolicy({
-      destinationAllowlist: [],
-      maxTransferAmount: "50.00",
-    });
-
-    const res = await app.request(
-      "/v1/payments/ramps/offramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId,
-          sourceWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          cryptoAmount: "75.25",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(403);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("FORBIDDEN");
-
-    const operation = await getDb(env)
-      .prepare("SELECT status, operation_family, operation_type FROM wallet_operations")
-      .first<{ status: string; operation_family: string; operation_type: string }>();
-    expect(operation).toMatchObject({
-      status: "failed",
-      operation_family: "ramp",
-      operation_type: "ramp_offramp_execute",
-    });
-
-    const evaluations = await getDb(env)
-      .prepare("SELECT decision, reason_code FROM policy_evaluations")
-      .all<{ decision: string; reason_code: string }>();
-    expect(evaluations.results).toHaveLength(2);
-    expect(evaluations.results).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ decision: "allow" }),
-        expect.objectContaining({
-          decision: "deny",
-          reason_code: "legacy_wallet_policy_denied",
-        }),
-      ])
-    );
-  });
-
-  it("does not apply outbound wallet policy checks to MoonPay on-ramp", async () => {
-    const counterpartyId = await seedCounterparty();
-    await seedWalletPolicy({
-      destinationAllowlist: [],
-      maxTransferAmount: "10.00",
-    });
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId,
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "25.00",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-  });
-
-  it("checks wallet bindings when a custody wallet public key is used for MoonPay off-ramp", async () => {
-    const counterpartyId = await seedCounterparty();
-    await seedCachedKey({
-      walletBindings: [{ walletId: "wal_other_wallet", permissions: ["payments:write"] }],
-    });
-
-    const res = await app.request(
-      "/v1/payments/ramps/offramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId,
-          sourceWallet: TEST_SOLANA_ADDRESSES.wallet1,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          cryptoAmount: "25.00",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(403);
-  });
-
-  it("returns bad request when MoonPay on-ramp amount is below the minimum", async () => {
-    const counterpartyId = await seedCounterparty();
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId,
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "10.00",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("BAD_REQUEST");
-    expect(body.error.message).toContain("at least 20 USD");
-  });
-
-  it("creates a Lightspark on-ramp quote through the execute endpoint", async () => {
+  it("creates a BVNK off-ramp channel quote with crypto-deposit instructions", async () => {
+    const depositAddress = TEST_SOLANA_ADDRESSES.wallet3;
     const counterpartyId = await seedCounterparty({
-      providerData: { lightspark: { customerId: "Customer:cus_123" } },
-    });
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            data: [
-              {
-                id: "ExternalAccount:acc_destination_123",
-                accountInfo: {
-                  accountType: "SOLANA_WALLET",
-                  address: TEST_SOLANA_ADDRESSES.wallet1,
-                },
+      externalId: "customer_456",
+      identity: { firstName: "Test", lastName: "User", address: { countryCode: "US" } },
+      providerData: {
+        bvnk: {
+          customer: { customerReference: "customer_456", status: "VERIFIED" },
+          offramp: {
+            wallets: { USD: { id: TEST_BVNK_OFFRAMP_WALLET_ID, status: "ACTIVE" } },
+            beneficiaries: {
+              "USD:abc123": {
+                key: "USD:abc123",
+                fiatCurrency: "USD",
+                accountType: "ACH",
+                createdAt: "2026-06-01T00:00:00.000Z",
               },
-            ],
-            hasMore: false,
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "Quote:ls_onramp_123",
-            quoteStatus: "PENDING",
-            paymentInstructions: [
-              {
-                accountOrWalletInfo: {
-                  accountType: "USD_ACCOUNT",
-                  paymentRails: ["ACH"],
-                  accountNumber: "1234567890",
-                  routingNumber: "021000021",
-                  reference: "ref_123",
-                },
-              },
-            ],
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      );
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "lightspark",
-          counterpartyId,
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "12.34",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: {
-        ramp: {
-          id: string;
-          provider: string;
-          status: string;
-          paymentInstructions: Array<{
-            provider: "lightspark";
-            accountOrWalletInfo: { paymentRails: string[] };
-          }>;
-          reference: string;
-        };
-      };
-    };
-
-    expect(body.data.ramp.id.startsWith("ramp_")).toBe(true);
-    expect(body.data.ramp.provider).toBe("lightspark");
-    expect(body.data.ramp.status).toBe("pending");
-    expect(body.data.ramp.reference).toBe("Quote:ls_onramp_123");
-    expect(body.data.ramp.paymentInstructions[0]?.provider).toBe("lightspark");
-    expect(body.data.ramp.paymentInstructions[0]?.accountOrWalletInfo.paymentRails[0]).toBe("ACH");
-
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const requestUrl = fetchSpy.mock.calls[1]?.[0];
-    const requestInit = fetchSpy.mock.calls[1]?.[1];
-    expect(String(requestUrl)).toBe(`${LIGHTSPARK_GRID_API_BASE_URL}/quotes`);
-    expect(requestInit?.method).toBe("POST");
-
-    const headers = requestInit?.headers as Record<string, string>;
-    expect(headers.Authorization).toBe(lightsparkBasicAuthHeader());
-
-    const payload = JSON.parse(String(requestInit?.body)) as {
-      lockedCurrencyAmount: number;
-      source: { sourceType: string; customerId: string; currency: string };
-      destination: { destinationType: string; accountId: string; currency: string };
-    };
-    expect(payload.lockedCurrencyAmount).toBe(1234);
-    expect(payload.source.sourceType).toBe("REALTIME_FUNDING");
-    expect(payload.source.customerId).toBe("Customer:cus_123");
-    expect(payload.source.currency).toBe("USD");
-    expect(payload.destination.destinationType).toBe("ACCOUNT");
-    expect(payload.destination.accountId).toBe("ExternalAccount:acc_destination_123");
-    expect(payload.destination.currency).toBe("USDC");
-    fetchSpy.mockRestore();
-  });
-
-  it("reuses an existing Lightspark external account for Solana wallet on-ramp destinations", async () => {
-    const counterpartyId = await seedCounterparty({
-      providerData: { lightspark: { customerId: "Customer:cus_123" } },
-    });
-    const destinationSolanaWallet = TEST_SOLANA_ADDRESSES.wallet2;
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            data: [
-              {
-                id: "ExternalAccount:acc_existing_123",
-                accountInfo: {
-                  accountType: "SOLANA_WALLET",
-                  address: destinationSolanaWallet,
-                },
-              },
-            ],
-            hasMore: false,
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "Quote:ls_onramp_existing_123",
-            quoteStatus: "PENDING",
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      );
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "lightspark",
-          counterpartyId,
-          destinationWallet: destinationSolanaWallet,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "5.00",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: { ramp: { provider: string; reference: string } };
-    };
-    expect(body.data.ramp.provider).toBe("lightspark");
-    expect(body.data.ramp.reference).toBe("Quote:ls_onramp_existing_123");
-
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const listUrl = new URL(String(fetchSpy.mock.calls[0]?.[0]));
-    expect(listUrl.pathname).toBe("/grid/2025-10-13/customers/external-accounts");
-    expect(listUrl.searchParams.get("customerId")).toBe("Customer:cus_123");
-    expect(listUrl.searchParams.get("currency")).toBe("USDC");
-    expect(listUrl.searchParams.get("limit")).toBe("100");
-
-    const quotePayload = JSON.parse(String(fetchSpy.mock.calls[1]?.[1]?.body)) as {
-      destination: { accountId: string };
-    };
-    expect(quotePayload.destination.accountId).toBe("ExternalAccount:acc_existing_123");
-    fetchSpy.mockRestore();
-  });
-
-  it("resolves SDP wallet ids for Lightspark on-ramp destinations", async () => {
-    const counterpartyId = await seedCounterparty({
-      providerData: { lightspark: { customerId: "Customer:cus_123" } },
-    });
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            data: [
-              {
-                id: "ExternalAccount:acc_wallet_123",
-                accountInfo: {
-                  accountType: "SOLANA_WALLET",
-                  address: TEST_SOLANA_ADDRESSES.wallet1,
-                },
-              },
-            ],
-            hasMore: false,
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "Quote:ls_onramp_wallet_123",
-            quoteStatus: "PENDING",
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      );
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "lightspark",
-          counterpartyId,
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "5.00",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: { ramp: { provider: string; reference: string } };
-    };
-    expect(body.data.ramp.provider).toBe("lightspark");
-    expect(body.data.ramp.reference).toBe("Quote:ls_onramp_wallet_123");
-
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const quotePayload = JSON.parse(String(fetchSpy.mock.calls[1]?.[1]?.body)) as {
-      destination: { accountId: string };
-    };
-    expect(quotePayload.destination.accountId).toBe("ExternalAccount:acc_wallet_123");
-    fetchSpy.mockRestore();
-  });
-
-  it("creates a Lightspark external account when Solana wallet destination is not found", async () => {
-    const counterpartyId = await seedCounterparty({
-      providerData: { lightspark: { customerId: "Customer:cus_123" } },
-    });
-    const destinationSolanaWallet = TEST_SOLANA_ADDRESSES.wallet3;
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            data: [],
-            hasMore: false,
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "ExternalAccount:acc_created_123",
-            accountInfo: {
-              accountType: "SOLANA_WALLET",
-              address: destinationSolanaWallet,
             },
-          }),
-          {
-            status: 201,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "Quote:ls_onramp_created_123",
-            quoteStatus: "PENDING",
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      );
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "lightspark",
-          counterpartyId,
-          destinationWallet: destinationSolanaWallet,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "5.00",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: { ramp: { provider: string; reference: string } };
-    };
-    expect(body.data.ramp.provider).toBe("lightspark");
-    expect(body.data.ramp.reference).toBe("Quote:ls_onramp_created_123");
-
-    expect(fetchSpy).toHaveBeenCalledTimes(3);
-    const createUrl = String(fetchSpy.mock.calls[1]?.[0]);
-    expect(createUrl).toBe(`${LIGHTSPARK_GRID_API_BASE_URL}/customers/external-accounts`);
-    const createPayload = JSON.parse(String(fetchSpy.mock.calls[1]?.[1]?.body)) as {
-      customerId: string;
-      currency: string;
-      accountInfo: { accountType: string; address: string };
-    };
-    expect(createPayload.customerId).toBe("Customer:cus_123");
-    expect(createPayload.currency).toBe("USDC");
-    expect(createPayload.accountInfo.accountType).toBe("SOLANA_WALLET");
-    expect(createPayload.accountInfo.address).toBe(destinationSolanaWallet);
-
-    const quotePayload = JSON.parse(String(fetchSpy.mock.calls[2]?.[1]?.body)) as {
-      destination: { accountId: string };
-    };
-    expect(quotePayload.destination.accountId).toBe("ExternalAccount:acc_created_123");
-    fetchSpy.mockRestore();
-  });
-
-  it("creates and executes a Lightspark off-ramp quote through the execute endpoint", async () => {
-    const counterpartyId = await seedCounterparty({
-      providerData: { lightspark: { customerId: "ExternalAccount:acc_destination_456" } },
-    });
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "Quote:ls_offramp_123",
-            quoteStatus: "PENDING",
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            id: "Quote:ls_offramp_123",
-            quoteStatus: "COMPLETED",
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      );
-
-    const res = await app.request(
-      "/v1/payments/ramps/offramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "lightspark",
-          counterpartyId,
-          sourceWallet: "InternalAccount:acc_source_123",
-          cryptoToken: "BTC",
-          fiatCurrency: "USD",
-          cryptoAmount: "0.015",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: { ramp: { id: string; provider: string; status: string; reference: string } };
-    };
-
-    expect(body.data.ramp.id.startsWith("ramp_")).toBe(true);
-    expect(body.data.ramp.provider).toBe("lightspark");
-    expect(body.data.ramp.status).toBe("completed");
-    expect(body.data.ramp.reference).toBe("Quote:ls_offramp_123");
-
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const quoteCallUrl = String(fetchSpy.mock.calls[0]?.[0]);
-    const executeCallUrl = String(fetchSpy.mock.calls[1]?.[0]);
-    expect(quoteCallUrl).toBe(`${LIGHTSPARK_GRID_API_BASE_URL}/quotes`);
-    expect(executeCallUrl).toBe(
-      `${LIGHTSPARK_GRID_API_BASE_URL}/quotes/Quote%3Als_offramp_123/execute`
-    );
-
-    const quoteCallPayload = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body)) as {
-      lockedCurrencyAmount: number;
-      source: { sourceType: string; accountId: string; currency: string };
-      destination: { destinationType: string; accountId: string; currency: string };
-    };
-    expect(quoteCallPayload.lockedCurrencyAmount).toBe(1500000);
-    expect(quoteCallPayload.source.sourceType).toBe("ACCOUNT");
-    expect(quoteCallPayload.source.accountId).toBe("InternalAccount:acc_source_123");
-    expect(quoteCallPayload.source.currency).toBe("BTC");
-    expect(quoteCallPayload.destination.destinationType).toBe("ACCOUNT");
-    expect(quoteCallPayload.destination.accountId).toBe("ExternalAccount:acc_destination_456");
-    expect(quoteCallPayload.destination.currency).toBe("USD");
-    fetchSpy.mockRestore();
-  });
-
-  it("onboards a BVNK customer and provisions the on-ramp rule through execute", async () => {
-    const counterpartyId = await seedCounterparty({
-      externalId: "bvnk_user_123",
-      identity: {
-        firstName: "Zach",
-        lastName: "Khong",
-        dateOfBirth: "1990-01-01",
-        address: {
-          line1: "Ave Street",
-          city: "NYC",
-          postalCode: "10001",
-          countryCode: "US",
-          subdivisionCode: "NY",
-        },
-        compliance: {
-          taxIdentification: { number: "123-45-6789", residenceCountryCode: "US" },
-          nationality: "US",
-          birthCountryCode: "US",
-          cdd: {
-            employmentStatus: "SALARIED",
-            sourceOfFunds: "SALARY",
-            pepStatus: "NOT_PEP",
-            intendedUseOfAccount: "TRANSFERS_OWN_WALLET",
-            expectedMonthlyVolume: { amount: "1000", currency: "USD" },
-            estimatedYearlyIncome: "INCOME_0_TO_50K",
-            employmentIndustrySector: "INFORMATION",
           },
         },
       },
     });
-
-    const jsonResponse = (payload: unknown, status = 200) =>
-      new Response(JSON.stringify(payload), {
-        status,
-        headers: { "Content-Type": "application/json" },
-      });
-
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
-      const url = String(input);
-      const method = (init?.method ?? "GET").toUpperCase();
-      if (url.endsWith("/platform/v1/customers/agreement/sessions") && method === "POST") {
-        return Promise.resolve(jsonResponse({ reference: "agr_1", agreements: [] }, 201));
-      }
-      if (url.includes("/platform/v1/customers/agreement/sessions/") && method === "PUT") {
-        return Promise.resolve(new Response(null, { status: 204 }));
-      }
-      if (url.endsWith("/platform/v1/customers") && method === "POST") {
-        return Promise.resolve(jsonResponse({ reference: "cust_1", status: "VERIFIED" }, 201));
-      }
-      if (url.includes("/ledger/v2/wallets/profiles") && method === "GET") {
-        return Promise.resolve(
-          jsonResponse({
-            content: [{ id: "fiat:usd:test", currencies: ["USD"], methods: ["ACH", "SWIFT"] }],
-          })
-        );
-      }
-      if (url.endsWith("/ledger/v2/wallets") && method === "POST") {
-        return Promise.resolve(
-          jsonResponse(
-            {
-              id: "wallet_1",
-              name: "SDP onramp",
-              status: "ACTIVE",
-              paymentInstruments: [
-                {
-                  type: "FIAT",
-                  accountNumber: "000123456789",
-                  remittanceInformationPrefix: "REF-1",
-                  bankDetails: { name: "BVNK Bank", bic: "BVNKUS33" },
-                },
-              ],
-            },
-            201
-          )
-        );
-      }
-      if (url.endsWith("/payment/v1/rules") && method === "POST") {
-        return Promise.resolve(
-          jsonResponse({
-            id: "rule_bvnk_123",
-            reference: "bvnk_reference_onramp",
-            status: "ACTIVE",
-            originator: { currency: "USD", walletId: "wallet_1" },
-          })
-        );
-      }
-      return Promise.resolve(jsonResponse({}, 404));
-    });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          uuid: "bvnk_channel_uuid_123",
+          reference: "bvnk_channel_reference",
+          status: "OPEN",
+          alternatives: [
+            { network: "ETHEREUM", address: "0xdeadbeef", uri: "ethereum:0xdeadbeef" },
+            { network: "SOLANA", address: depositAddress, uri: `solana:${depositAddress}` },
+          ],
+        }),
+        { status: 201, headers: { "Content-Type": "application/json" } }
+      )
+    );
 
     const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
+      "/v1/payments/ramps/offramp/quote",
       {
         method: "POST",
         headers: {
@@ -4825,10 +5490,10 @@ describe("Payments routes", () => {
         body: JSON.stringify({
           provider: "bvnk",
           counterpartyId,
-          destinationWallet: TEST_WALLET_ID,
+          sourceWallet: TEST_WALLET_ID,
           cryptoToken: "USDC",
           fiatCurrency: "USD",
-          fiatAmount: "120.50",
+          cryptoAmount: "75.25",
         }),
       },
       env
@@ -4837,195 +5502,58 @@ describe("Payments routes", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as {
       data: {
-        ramp: {
+        quote: {
           id: string;
           provider: string;
           status: string;
-          reference: string;
+          deliveryMode: string;
           paymentInstructions: {
-            provider: string;
-            onboardingStatus: string;
-            ruleId: string;
-            fundingWalletId: string;
-            fiatCurrency: string;
-            beneficiaryAddress: string;
+            kind: string;
+            destinationAddress: string;
             network: string;
-            bankAccount?: { accountNumber?: string; bankName?: string };
+            cryptoCurrency: string;
+            fiatCurrency: string;
           }[];
         };
       };
     };
 
-    expect(body.data.ramp.provider).toBe("bvnk");
-    expect(body.data.ramp.status).toBe("pending");
-    const instruction = body.data.ramp.paymentInstructions[0];
-    expect(instruction?.provider).toBe("bvnk");
-    expect(instruction?.onboardingStatus).toBe("ready");
-    expect(instruction?.ruleId).toBe("rule_bvnk_123");
-    expect(instruction?.fundingWalletId).toBe("wallet_1");
-    expect(instruction?.fiatCurrency).toBe("USD");
-    expect(instruction?.beneficiaryAddress).toBe(TEST_SOLANA_ADDRESSES.wallet1);
+    expect(body.data.quote.provider).toBe("bvnk");
+    expect(body.data.quote.deliveryMode).toBe("manual_instructions");
+    expect(body.data.quote.id).toBe("bvnk_channel_uuid_123");
+    expect(body.data.quote.status).toBe("pending");
+    const instruction = body.data.quote.paymentInstructions[0];
+    expect(instruction?.kind).toBe("crypto_deposit");
+    expect(instruction?.destinationAddress).toBe(depositAddress);
     expect(instruction?.network).toBe("SOLANA");
-    expect(instruction?.bankAccount?.accountNumber).toBe("000123456789");
-    expect(instruction?.bankAccount?.bankName).toBe("BVNK Bank");
+    expect(instruction?.cryptoCurrency).toBe("USDC");
+    expect(instruction?.fiatCurrency).toBe("USD");
 
-    const calledUrls = fetchSpy.mock.calls.map((call) => String(call[0]));
-    expect(calledUrls).toContain(`${TEST_BVNK_API_BASE_URL}/payment/v1/rules`);
-    expect(calledUrls).toContain(`${TEST_BVNK_API_BASE_URL}/ledger/v2/wallets`);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const channelUrl = String(fetchSpy.mock.calls[0]?.[0]);
+    expect(channelUrl).toBe(`${TEST_BVNK_API_BASE_URL}/api/v2/channel`);
+    const channelHeaders = fetchSpy.mock.calls[0]?.[1]?.headers as Record<string, string>;
+    expect(channelHeaders.Authorization).toContain(`Hawk id="${TEST_BVNK_HAWK_AUTH_ID}"`);
 
-    const ruleCall = fetchSpy.mock.calls.find((call) =>
-      String(call[0]).endsWith("/payment/v1/rules")
-    );
-    const ruleInit = ruleCall?.[1];
-    expect((ruleInit?.headers as Record<string, string>).Authorization).toMatch(/^Hawk /);
-    const payload = JSON.parse(String(ruleInit?.body)) as {
-      trigger: string;
+    const channelPayload = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body)) as {
       walletId: string;
-      beneficiary: {
-        currency: string;
-        entity: { type: string; customerIdentifier: string; address: { countryCode: string } };
-        cryptoAddress: { network: string; address: string };
-      };
-    };
-    expect(payload.trigger).toBe("payment:payin:fiat");
-    expect(payload.walletId).toBe("wallet_1");
-    expect(payload.beneficiary.currency).toBe("USDC");
-    expect(payload.beneficiary.entity.customerIdentifier).toBe("cust_1");
-    expect(payload.beneficiary.cryptoAddress.address).toBe(TEST_SOLANA_ADDRESSES.wallet1);
-
-    const walletCall = fetchSpy.mock.calls.find((call) =>
-      String(call[0]).endsWith("/ledger/v2/wallets")
-    );
-    expect((walletCall?.[1]?.headers as Record<string, string>)["Idempotency-Key"]).toBeTruthy();
-    fetchSpy.mockRestore();
-  });
-
-  it("creates and accepts a BVNK off-ramp estimate through the execute endpoint", async () => {
-    const counterpartyId = await seedCounterparty({
-      externalId: "customer_456",
-      identity: { address: { countryCode: "US" } },
-      providerData: {
-        bvnk: {
-          customer: { customerReference: "customer_456", status: "VERIFIED" },
-          offramp: { wallets: { USD: { id: TEST_BVNK_OFFRAMP_WALLET_ID, status: "ACTIVE" } } },
-        },
-      },
-    });
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            externalId: "estimate_bvnk_123",
-          }),
-          {
-            status: 201,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      )
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            uuid: "bvnk_offramp_uuid_123",
-            status: "PROCESSING",
-            reference: "bvnk_offramp_reference",
-          }),
-          {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }
-        )
-      );
-
-    const res = await app.request(
-      "/v1/payments/ramps/offramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "bvnk",
-          counterpartyId,
-          sourceWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          cryptoAmount: "75.25",
-          bvnkCompliance: {
-            partyDetails: [
-              {
-                type: "BENEFICIARY",
-                entityType: "INDIVIDUAL",
-                relationshipType: "THIRD_PARTY",
-                firstName: "Test",
-                lastName: "User",
-                dateOfBirth: "1990-01-01",
-                countryCode: "US",
-              },
-            ],
-          },
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      data: { ramp: { id: string; provider: string; status: string; reference: string } };
-    };
-
-    expect(body.data.ramp.id.startsWith("ramp_")).toBe(true);
-    expect(body.data.ramp.provider).toBe("bvnk");
-    expect(body.data.ramp.status).toBe("processing");
-    expect(body.data.ramp.reference).toBe("bvnk_offramp_uuid_123");
-
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-
-    const estimateUrl = String(fetchSpy.mock.calls[0]?.[0]);
-    const acceptUrl = String(fetchSpy.mock.calls[1]?.[0]);
-    expect(estimateUrl).toBe(`${TEST_BVNK_API_BASE_URL}/api/v1/pay/estimate`);
-    expect(acceptUrl).toBe(
-      `${TEST_BVNK_API_BASE_URL}/api/v1/pay/estimate/estimate_bvnk_123/accept`
-    );
-    const estimateHeaders = fetchSpy.mock.calls[0]?.[1]?.headers as Record<string, string>;
-    const acceptHeaders = fetchSpy.mock.calls[1]?.[1]?.headers as Record<string, string>;
-    expect(estimateHeaders.Authorization).toContain(`Hawk id="${TEST_BVNK_HAWK_AUTH_ID}"`);
-    expect(acceptHeaders.Authorization).toContain(`Hawk id="${TEST_BVNK_HAWK_AUTH_ID}"`);
-
-    const estimatePayload = JSON.parse(String(fetchSpy.mock.calls[0]?.[1]?.body)) as {
-      walletId: string;
-      walletCurrency: string;
-      paidCurrency: string;
-      paidRequiredAmount: number;
-      network: string;
-      complianceDetails: { partyDetails: Record<string, unknown>[] };
-    };
-    expect(estimatePayload.walletId).toBe(TEST_BVNK_OFFRAMP_WALLET_ID);
-    expect(estimatePayload.walletCurrency).toBe("USD");
-    expect(estimatePayload.paidCurrency).toBe("USDC");
-    expect(estimatePayload.paidRequiredAmount).toBe(75.25);
-    expect(estimatePayload.network).toBe("SOLANA");
-    expect(estimatePayload.complianceDetails.partyDetails).toHaveLength(1);
-
-    const acceptPayload = JSON.parse(String(fetchSpy.mock.calls[1]?.[1]?.body)) as {
+      payCurrency: string;
+      displayCurrency: string;
       customerId: string;
-      payOutDetails: { currency: string; address: string; network: string };
       complianceDetails: { partyDetails: Record<string, unknown>[] };
     };
-    expect(acceptPayload.customerId).toBe("customer_456");
-    expect(acceptPayload.payOutDetails.currency).toBe("USDC");
-    expect(acceptPayload.payOutDetails.address).toBe(TEST_SOLANA_ADDRESSES.wallet1);
-    expect(acceptPayload.payOutDetails.network).toBe("SOLANA");
-    expect(acceptPayload.complianceDetails.partyDetails).toHaveLength(1);
+    expect(channelPayload.walletId).toBe(TEST_BVNK_OFFRAMP_WALLET_ID);
+    expect(channelPayload.payCurrency).toBe("USDC");
+    expect(channelPayload.displayCurrency).toBe("USD");
+    expect(channelPayload.customerId).toBe("customer_456");
+    expect(channelPayload.complianceDetails.partyDetails).toHaveLength(1);
     fetchSpy.mockRestore();
   });
 
-  it("returns bad request when BVNK off-ramp is missing compliance party details", async () => {
+  it("rejects a BVNK off-ramp quote until the payout beneficiary is provisioned", async () => {
     const counterpartyId = await seedCounterparty({
       externalId: "customer_456",
-      identity: { address: { countryCode: "US" } },
+      identity: { firstName: "Test", lastName: "User", address: { countryCode: "US" } },
       providerData: {
         bvnk: {
           customer: { customerReference: "customer_456", status: "VERIFIED" },
@@ -5035,12 +5563,11 @@ describe("Payments routes", () => {
     });
 
     const res = await app.request(
-      "/v1/payments/ramps/offramp/execute",
+      "/v1/payments/ramps/offramp/quote",
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "x-forwarded-for": "1.1.1.1",
           Authorization: `Bearer ${TEST_API_KEY.raw}`,
         },
         body: JSON.stringify({
@@ -5055,10 +5582,9 @@ describe("Payments routes", () => {
       env
     );
 
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("BAD_REQUEST");
-    expect(body.error.message).toContain("bvnkCompliance.partyDetails is required");
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("CONFLICT");
   });
 
   async function seedRampTransfer(input: {
@@ -5156,149 +5682,140 @@ describe("Payments routes", () => {
     expect(row?.status).toBe("settling");
   });
 
-  it("returns bad request when provider is not supported", async () => {
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
+  it("activates immutable wallet control profile revisions from wallet policy updates", async () => {
+    const rules = [
       {
-        method: "POST",
+        id: "deny-raw-signing",
+        kind: "operation_family",
+        family: "raw_sign",
+        action: "deny",
+      },
+      {
+        id: "approval-for-payments",
+        kind: "approval",
+        families: ["payment"],
+        action: "approval_required",
+      },
+    ];
+
+    const updateRes = await app.request(
+      `/v1/payments/wallets/${TEST_WALLET_ID}/policies`,
+      {
+        method: "PUT",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${TEST_API_KEY.raw}`,
         },
         body: JSON.stringify({
-          provider: "unsupported_provider",
-          counterpartyId: "cp_test",
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "10.00",
+          destinationAllowlist: [TEST_SOLANA_ADDRESSES.wallet2],
+          maxTransferAmount: "5",
+          defaultAction: "allow",
+          rules,
         }),
       },
       env
     );
 
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("BAD_REQUEST");
-    expect(body.error.message).toContain("Invalid request body");
-  });
-
-  it("returns bad request when on-ramp amount is zero", async () => {
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId: "cp_test",
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "0",
-        }),
-      },
-      env
-    );
-
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as {
-      error: { code: string; message: string; details?: { errors?: Record<string, string[]> } };
+    expect(updateRes.status).toBe(200);
+    const updateBody = (await updateRes.json()) as {
+      data: {
+        policy: {
+          destinationAllowlist: string[];
+          maxTransferAmount?: string;
+          defaultAction?: string;
+          rules?: unknown[];
+          controlProfile?: {
+            id: string;
+            status: string;
+            revisionId: string;
+            revisionNumber: number;
+            providerMappingStatus: string;
+          };
+        };
+      };
     };
-    expect(body.error.code).toBe("BAD_REQUEST");
-    expect(body.error.message).toContain("Invalid request body");
-    expect(body.error.details?.errors?.fiatAmount).toContain("Amount must be greater than zero");
-  });
+    expect(updateBody.data.policy.destinationAllowlist).toEqual([TEST_SOLANA_ADDRESSES.wallet2]);
+    expect(updateBody.data.policy.maxTransferAmount).toBe("5");
+    expect(updateBody.data.policy.defaultAction).toBe("allow");
+    expect(updateBody.data.policy.rules).toEqual(rules);
+    expect(updateBody.data.policy.controlProfile).toMatchObject({
+      status: "active",
+      revisionNumber: 1,
+      providerMappingStatus: "not_applicable",
+    });
 
-  it("returns forbidden when MoonPay is not configured in the environment", async () => {
-    env.MOONPAY_SANDBOX_API_KEY = undefined;
+    const revisionRows = await getDb(env)
+      .prepare(
+        `SELECT revision_number, default_action, rules
+         FROM wallet_control_profile_revisions
+         ORDER BY revision_number ASC`
+      )
+      .all<{
+        revision_number: number;
+        default_action: string;
+        rules: unknown;
+      }>();
+    expect(revisionRows.results).toHaveLength(1);
+    expect(revisionRows.results[0]).toMatchObject({
+      revision_number: 1,
+      default_action: "allow",
+    });
 
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
+    const secondRes = await app.request(
+      `/v1/payments/wallets/${TEST_WALLET_ID}/policies`,
       {
-        method: "POST",
+        method: "PUT",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${TEST_API_KEY.raw}`,
         },
         body: JSON.stringify({
-          provider: "moonpay",
-          counterpartyId: "cp_test",
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "20",
+          destinationAllowlist: [],
+          defaultAction: "allow",
+          rules: [
+            {
+              id: "deny-programs",
+              kind: "operation_family",
+              family: "program",
+              action: "deny",
+            },
+          ],
         }),
       },
       env
     );
 
-    expect(res.status).toBe(403);
-    const body = (await res.json()) as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("FORBIDDEN");
-    expect(body.error.message).toContain("MoonPay is not configured");
-  });
+    expect(secondRes.status).toBe(200);
+    const secondBody = (await secondRes.json()) as typeof updateBody;
+    expect(secondBody.data.policy.controlProfile?.id).toBe(
+      updateBody.data.policy.controlProfile?.id
+    );
+    expect(secondBody.data.policy.controlProfile?.revisionNumber).toBe(2);
 
-  it("returns forbidden when Lightspark is not configured in the environment", async () => {
-    env.LIGHTSPARK_GRID_SANDBOX_CLIENT_ID = undefined;
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
+    const getRes = await app.request(
+      `/v1/payments/wallets/${TEST_WALLET_ID}/policies`,
       {
-        method: "POST",
         headers: {
-          "Content-Type": "application/json",
           Authorization: `Bearer ${TEST_API_KEY.raw}`,
         },
-        body: JSON.stringify({
-          provider: "lightspark",
-          counterpartyId: "cp_test",
-          destinationWallet: "ExternalAccount:acc_destination_123",
-          cryptoToken: "BTC",
-          fiatCurrency: "USD",
-          fiatAmount: "10",
-        }),
       },
       env
     );
 
-    expect(res.status).toBe(403);
-    const body = (await res.json()) as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("FORBIDDEN");
-    expect(body.error.message).toContain("Lightspark is not configured");
-  });
-
-  it("returns forbidden when BVNK is not configured in the environment", async () => {
-    env.BVNK_SANDBOX_HAWK_AUTH_ID = undefined;
-    env.BVNK_SANDBOX_HAWK_SECRET_KEY = undefined;
-
-    const res = await app.request(
-      "/v1/payments/ramps/onramp/execute",
+    expect(getRes.status).toBe(200);
+    const getBody = (await getRes.json()) as typeof updateBody;
+    expect(getBody.data.policy.controlProfile).toMatchObject({
+      id: updateBody.data.policy.controlProfile?.id,
+      revisionNumber: 2,
+    });
+    expect(getBody.data.policy.rules).toEqual([
       {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${TEST_API_KEY.raw}`,
-        },
-        body: JSON.stringify({
-          provider: "bvnk",
-          counterpartyId: "cp_test",
-          destinationWallet: TEST_WALLET_ID,
-          cryptoToken: "USDC",
-          fiatCurrency: "USD",
-          fiatAmount: "10",
-        }),
+        id: "deny-programs",
+        kind: "operation_family",
+        family: "program",
+        action: "deny",
       },
-      env
-    );
-
-    expect(res.status).toBe(403);
-    const body = (await res.json()) as { error: { code: string; message: string } };
-    expect(body.error.code).toBe("FORBIDDEN");
-    expect(body.error.message).toContain("BVNK is not configured");
+    ]);
   });
 
   it("blocks prepare transfer when destination is outside allowlist", async () => {

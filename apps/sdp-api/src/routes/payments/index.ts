@@ -8,6 +8,7 @@ import type { Env } from "@/types/env";
 import {
   activateRecurringPayment,
   cancelRampTransfer,
+  cancelRecurringPayment,
   collectRecurringPayment,
   createOfframpQuote,
   createOnrampQuote,
@@ -17,14 +18,15 @@ import {
   createSubscriptionCollectionAttempt,
   createSubscriptionPlan,
   createTransfer,
+  createTransferBatch,
   estimateOfframp,
   estimateOnramp,
-  executeOfframp,
-  executeOnramp,
+  estimateTransferBatch,
   getRecurringPayment,
   getSubscription,
   getSubscriptionPlan,
   getTransfer,
+  getTransferBatch,
   getWalletBalances,
   getWalletPolicy,
   listOfframpCurrencies,
@@ -34,6 +36,7 @@ import {
   listSubscriptionCollectionAttempts,
   listSubscriptionPlans,
   listSubscriptions,
+  listTransferBatches,
   listTransfers,
   prepareCancelSubscription,
   prepareCreateSubscriptionPlan,
@@ -42,7 +45,9 @@ import {
   prepareSubscriptionCollection,
   prepareTransfer,
   recordRampProviderEvent,
+  resumeRecurringPayment,
   simulateSandboxTransfer,
+  updateRecurringPayment,
   updateSubscription,
   updateSubscriptionPlan,
   updateWalletPolicy,
@@ -98,15 +103,30 @@ payments.post(
   createRecurringPayment
 );
 payments.get("/recurring-payments", requirePermissions("payments:read"), listRecurringPayments);
+payments.patch(
+  "/recurring-payments/:id",
+  requirePermissions("payments:write", "wallets:read", "counterparties:read"),
+  updateRecurringPayment
+);
 payments.post(
   "/recurring-payments/:id/activate",
   requirePermissions("payments:write", "wallets:read"),
   activateRecurringPayment
 );
 payments.post(
+  "/recurring-payments/:id/cancel",
+  requirePermissions("payments:write", "wallets:read"),
+  cancelRecurringPayment
+);
+payments.post(
   "/recurring-payments/:id/collect",
   requirePermissions("payments:write", "wallets:read"),
   collectRecurringPayment
+);
+payments.post(
+  "/recurring-payments/:id/resume",
+  requirePermissions("payments:write", "wallets:read"),
+  resumeRecurringPayment
 );
 payments.get("/recurring-payments/:id", requirePermissions("payments:read"), getRecurringPayment);
 payments.get("/subscription-plans", requirePermissions("payments:read"), listSubscriptionPlans);
@@ -173,6 +193,18 @@ payments.get(
 );
 payments.post("/transfers", requirePermissions("payments:write", "wallets:read"), createTransfer);
 payments.get("/transfers", requirePermissions("payments:read"), listTransfers);
+payments.post(
+  "/transfer-batches/estimate",
+  requirePermissions("payments:read", "wallets:read", "counterparties:read"),
+  estimateTransferBatch
+);
+payments.post(
+  "/transfer-batches",
+  requirePermissions("payments:write", "wallets:read", "counterparties:read"),
+  createTransferBatch
+);
+payments.get("/transfer-batches", requirePermissions("payments:read"), listTransferBatches);
+payments.get("/transfer-batches/:batchId", requirePermissions("payments:read"), getTransferBatch);
 payments.get("/requests", requirePermissions("payments:read"), listPaymentRequests);
 payments.post(
   "/requests",
@@ -190,19 +222,9 @@ payments.post(
   createOnrampQuote
 );
 payments.post(
-  "/ramps/onramp/execute",
-  requirePermissions("payments:write", "wallets:read"),
-  executeOnramp
-);
-payments.post(
   "/ramps/offramp/quote",
   requirePermissions("payments:write", "wallets:read"),
   createOfframpQuote
-);
-payments.post(
-  "/ramps/offramp/execute",
-  requirePermissions("payments:write", "wallets:read"),
-  executeOfframp
 );
 payments.post(
   "/ramps/:provider/events",

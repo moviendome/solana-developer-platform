@@ -2,10 +2,15 @@ import type { SdpEnvironment } from "@sdp/types";
 import type { Address } from "@solana/kit";
 import type { Context } from "hono";
 import {
+  createCounterpartiesRepository,
+  createCounterpartyAccountsRepository,
   createPaymentRecurringPaymentsRepository,
   createPaymentSubscriptionsRepository,
   createPaymentsRepository,
+  createPaymentTransferBatchesRepository,
+  createPolicyRepository,
 } from "@/db/repositories";
+import { resolveKoraUserId } from "@/lib/kora-user";
 import type { RampRuntimeContext } from "@/lib/ramps/types";
 import * as feePaymentAdapters from "@/services/adapters/fee-payment";
 import type { Env } from "@/types/env";
@@ -36,6 +41,14 @@ export function getPaymentsRepository(c: AppContext) {
   return createPaymentsRepository(c.env);
 }
 
+export function getCounterpartiesRepository(c: AppContext) {
+  return createCounterpartiesRepository(c.env);
+}
+
+export function getCounterpartyAccountsRepository(c: AppContext) {
+  return createCounterpartyAccountsRepository(c.env);
+}
+
 export function getPaymentSubscriptionsRepository(c: AppContext) {
   return createPaymentSubscriptionsRepository(c.env);
 }
@@ -44,8 +57,16 @@ export function getPaymentRecurringPaymentsRepository(c: AppContext) {
   return createPaymentRecurringPaymentsRepository(c.env);
 }
 
+export function getPaymentTransferBatchesRepository(c: AppContext) {
+  return createPaymentTransferBatchesRepository(c.env);
+}
+
+export function getPolicyRepository(c: AppContext) {
+  return createPolicyRepository(c.env);
+}
+
 export function getFeePayment(c: AppContext) {
-  return feePaymentAdapters.createFeePaymentAdapter(c.env);
+  return feePaymentAdapters.createFeePaymentAdapter(c.env, resolveKoraUserId(c));
 }
 
 export async function getSponsoredFeePayer(c: AppContext): Promise<Address> {
